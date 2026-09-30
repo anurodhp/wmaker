@@ -994,6 +994,14 @@ WDDomain *wDefaultsInitDomain(const char *domain, Bool requireDictionary)
 	db->domain_name = domain;
 	db->path = wdefaultspathfordomain(domain);
 
+	/*
+	 * stbuf.st_mtime is read below even when the stat() fails (no user file
+	 * yet); it used to be stack garbage, which could put the domain's
+	 * timestamp far in the future and make the change check ignore the file
+	 * once it was created (DAR-433).
+	 */
+	memset(&stbuf, 0, sizeof stbuf);
+
 	if (stat(db->path, &stbuf) >= 0) {
 		db->dictionary = WMReadPropListFromFile(db->path);
 		if (db->dictionary) {
