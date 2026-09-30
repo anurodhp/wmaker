@@ -1,3 +1,8 @@
+*** This is the anurodhp/wmaker fork used by the Darwin/XNU Raspberry Pi 3 port
+*** (https://github.com/anurodhp/xnu-iokit-pi3). For what differs from upstream,
+*** including the performance work and its measured results, see
+*** README.iokit-port.md.
+
 
 
 
