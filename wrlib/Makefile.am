@@ -34,6 +34,7 @@ libwraster_la_SOURCES = 	\
 	gradient.c 	\
 	xpixmap.c	\
 	convert.h 	\
+	fastpath.h	\
 	convert.c 	\
 	context.c 	\
 	misc.c 		\

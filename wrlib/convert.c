@@ -35,6 +35,7 @@
 
 #include "wraster.h"
 #include "convert.h"
+#include "fastpath.h"
 #include "xutil.h"
 #include "wr_i18n.h"
 
@@ -321,6 +322,24 @@ static RXImage *image2TrueColor(RContext * ctx, RImage * image)
 		RErrorCode = RERR_NOMEMORY;
 		RDestroyXImage(ctx, ximg);
 		return NULL;
+	}
+
+	/*
+	 * DAR-437 fast path: 32bpp ZPixmap and 8-bit masks. With masks 0xff,
+	 * computeTable() gives table[i] == i ((i*0xff+0x7f)/0xff), dr=dg=db=1,
+	 * so the dither error (pixel - r*dr) is always 0 and both render modes
+	 * reduce to pixel = r<<roffs | g<<goffs | b<<boffs, which
+	 * _XPutPixel32 (libX11 src/ImUtil.c:727-750) stores at
+	 * data[y*bytes_per_line + 4*x] honouring byte_order. Do that directly,
+	 * NEON when available; every other visual keeps the generic code below.
+	 */
+	if (rmask == 0xff && gmask == 0xff && bmask == 0xff &&
+	    ximg->image->format == ZPixmap && ximg->image->bits_per_pixel == 32 &&
+	    ximg->image->data != NULL) {
+		wr_pack32((unsigned char *)ximg->image->data, ximg->image->bytes_per_line,
+			  image->data, image->width, image->height, channels,
+			  roffs, goffs, boffs, ximg->image->byte_order == MSBFirst);
+		return ximg;
 	}
 
 	if (ctx->attribs->render_mode == RBestMatchRendering) {

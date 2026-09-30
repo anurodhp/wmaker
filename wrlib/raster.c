@@ -28,6 +28,7 @@
 #include <X11/Xlib.h>
 
 #include "wraster.h"
+#include "fastpath.h"
 #include "wr_i18n.h"
 
 #include <assert.h>
@@ -188,20 +189,8 @@ void RCombineImages(RImage * image, RImage * src)
 		s = src->data;
 
 		if (!HAS_ALPHA(image)) {
-			for (i = 0; i < image->height * image->width; i++) {
-				alpha = *(s + 3);
-				calpha = 255 - alpha;
-				*d = (((int)*d * calpha) + ((int)*s * alpha)) / 256;
-				d++;
-				s++;
-				*d = (((int)*d * calpha) + ((int)*s * alpha)) / 256;
-				d++;
-				s++;
-				*d = (((int)*d * calpha) + ((int)*s * alpha)) / 256;
-				d++;
-				s++;
-				s++;
-			}
+			/* DAR-437: same integer formula, NEON (fastpath.h) */
+			wr_blend_rgb_rgba(d, s, image->height * image->width);
 		} else {
 			RCombineAlpha(d, s, 1, image->width, image->height, 0, 0, 255);
 		}
@@ -228,17 +217,7 @@ void RCombineImagesWithOpaqueness(RImage * image, RImage * src, int opaqueness)
 
 	if (!HAS_ALPHA(src)) {
 		if (!HAS_ALPHA(image)) {
-			for (i = 0; i < image->width * image->height; i++) {
-				*d = (((int)*d * (int)COP) + ((int)*s * (int)OP)) / 256;
-				d++;
-				s++;
-				*d = (((int)*d * (int)COP) + ((int)*s * (int)OP)) / 256;
-				d++;
-				s++;
-				*d = (((int)*d * (int)COP) + ((int)*s * (int)OP)) / 256;
-				d++;
-				s++;
-			}
+			wr_blend_bytes_op(d, s, image->width * image->height * 3, OP);
 		} else {
 			RCombineAlpha(d, s, 0, image->width, image->height, 0, 0, OP);
 		}
@@ -357,22 +336,9 @@ void RCombineArea(RImage * image, RImage * src, int sx, int sy, unsigned width, 
 
 		if (!dalpha) {
 			for (y = 0; y < height; y++) {
-				for (x = 0; x < width; x++) {
-					alpha = *(s + 3);
-					calpha = 255 - alpha;
-					*d = (((int)*d * calpha) + ((int)*s * alpha)) / 256;
-					s++;
-					d++;
-					*d = (((int)*d * calpha) + ((int)*s * alpha)) / 256;
-					s++;
-					d++;
-					*d = (((int)*d * calpha) + ((int)*s * alpha)) / 256;
-					s++;
-					d++;
-					s++;
-				}
-				d += dwi;
-				s += swi;
+				wr_blend_rgb_rgba(d, s, width);
+				d += width * 3 + dwi;
+				s += width * 4 + swi;
 			}
 		} else {
 			RCombineAlpha(d, s, 1, width, height, dwi, swi, 255);

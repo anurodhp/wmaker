@@ -30,6 +30,7 @@
 #include <assert.h>
 
 #include "wraster.h"
+#include "fastpath.h"
 #include "wr_i18n.h"
 
 
@@ -138,42 +139,8 @@ static RImage *renderHGradient(unsigned width, unsigned height, int r0, int g0, 
 
 static inline unsigned char *renderGradientWidth(unsigned char *ptr, unsigned width, unsigned char r, unsigned char g, unsigned char b)
 {
-	int i;
-
-	for (i = width / 4; i--;) {
-		*ptr++ = r;
-		*ptr++ = g;
-		*ptr++ = b;
-
-		*ptr++ = r;
-		*ptr++ = g;
-		*ptr++ = b;
-
-		*ptr++ = r;
-		*ptr++ = g;
-		*ptr++ = b;
-
-		*ptr++ = r;
-		*ptr++ = g;
-		*ptr++ = b;
-	}
-	switch (width % 4) {
-	case 3:
-		*ptr++ = r;
-		*ptr++ = g;
-		*ptr++ = b;
-		/* FALLTHRU */
-	case 2:
-		*ptr++ = r;
-		*ptr++ = g;
-		*ptr++ = b;
-		/* FALLTHRU */
-	case 1:
-		*ptr++ = r;
-		*ptr++ = g;
-		*ptr++ = b;
-	}
-	return ptr;
+	/* DAR-437: NEON 16-pixel stores (fastpath.h), scalar tail */
+	return wr_fill_rgb(ptr, width, r, g, b);
 }
 
 /*
