@@ -44,6 +44,7 @@ static void synchronizeUserDefaults(void *foo);
 /* Check defaults database for changes every this many milliseconds */
 /* XXX: this is shared with src/ stuff, put it in some common header */
 #define UD_SYNC_INTERVAL	2000
+#define UD_SYNC_LEEWAY		1000	/* ms; coalesces with the wmaker defaults poll (DAR-432) */
 #endif
 
 const char *wusergnusteppath(void)
@@ -164,7 +165,7 @@ static void addSynchronizeTimerHandler(void)
 	static Bool initialized = False;
 
 	if (!initialized) {
-		WMAddPersistentTimerHandler(UD_SYNC_INTERVAL,
+		WMAddPersistentTimerHandlerWithLeeway(UD_SYNC_INTERVAL, UD_SYNC_LEEWAY,
 		    synchronizeUserDefaults, NULL);
 		initialized = True;
 	}

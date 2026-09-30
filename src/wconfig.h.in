@@ -325,6 +325,8 @@
 #ifndef HAVE_INOTIFY
 /* Check defaults database for changes every this many milliseconds */
 #define DEFAULTS_CHECK_INTERVAL	2000
+/* ms the poll may run late so that its wake-up coalesces with other idle timers (DAR-432) */
+#define DEFAULTS_CHECK_LEEWAY	1000
 #endif
 
 #define KEY_CONTROL_WINDOW_WEIGHT 1

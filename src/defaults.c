@@ -1168,7 +1168,7 @@ void wDefaultsCheckDomains(void* arg)
 	}
 #ifndef HAVE_INOTIFY
 	if (!arg)
-		WMAddTimerHandler(DEFAULTS_CHECK_INTERVAL, wDefaultsCheckDomains, arg);
+		WMAddTimerHandlerWithLeeway(DEFAULTS_CHECK_INTERVAL, DEFAULTS_CHECK_LEEWAY, wDefaultsCheckDomains, arg);
 #endif
 }
 

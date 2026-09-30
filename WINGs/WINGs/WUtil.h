@@ -318,6 +318,18 @@ WMHandlerID WMAddTimerHandler(int milliseconds, WMCallback *callback,
 WMHandlerID WMAddPersistentTimerHandler(int milliseconds, WMCallback *callback,
                                         void *cdata);
 
+/*
+ * Timers run on a monotonic clock. The variants with leeway let the timer
+ * fire up to leewayMs after its deadline, so the kernel can coalesce the
+ * wake-up with others (WMAddTimerHandler and WMAddPersistentTimerHandler
+ * use 10% of the interval, at most 50 ms).
+ */
+WMHandlerID WMAddTimerHandlerWithLeeway(int milliseconds, int leewayMs,
+                                        WMCallback *callback, void *cdata);
+
+WMHandlerID WMAddPersistentTimerHandlerWithLeeway(int milliseconds, int leewayMs,
+                                                  WMCallback *callback, void *cdata);
+
 void WMDeleteTimerWithClientData(void *cdata);
 
 void WMDeleteTimerHandler(WMHandlerID handlerID);

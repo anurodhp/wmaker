@@ -17,12 +17,21 @@
 
 #include <time.h>
 
+#ifdef __APPLE__
+# include <mach/mach_time.h>
+# include <dlfcn.h>
+#endif
+
 #ifdef WM_USE_KQUEUE
 # include <sys/event.h>
 # include <fcntl.h>
 # include <errno.h>
 # include <string.h>
 # include <pthread.h>
+# if defined(__APPLE__) && defined(NOTE_MACHTIME) && defined(NOTE_LEEWAY) && defined(__arm64__)
+#  include <sys/syscall.h>
+#  define WM_KQ_TIMER		/* EVFILT_TIMER with NOTE_MACHTIME|NOTE_LEEWAY, see kq_timer_arm() */
+# endif
 #endif
 
 #ifndef X_GETTIMEOFDAY
@@ -35,6 +44,7 @@ typedef struct TimerHandler {
 	void *clientData;
 	struct TimerHandler *next;
 	int nextDelay;		/* 0 if it's one-shot */
+	int leeway;		/* ms after `when` this timer may be late, for coalescing */
 } TimerHandler;
 
 typedef struct IdleHandler {
@@ -58,9 +68,61 @@ static WMArray *inputHandler = NULL;
 
 #define timerPending()	(timerHandler)
 
+/*
+ * Timer deadlines are kept as timevals on a MONOTONIC clock, not on the
+ * wall clock (DAR-432). chronyd calls settimeofday() on this port (DAR-169)
+ * and a wall-clock deadline then fires early (forward step) or waits for
+ * the step size (backward step). The Darwin clock is mach_absolute_time():
+ * it is the clock the kernel's own kevent()/select() timeouts run on
+ * (kern_event.c kevent_get_timeout -> clock_absolutetime_interval_to_deadline)
+ * and the epoch of EVFILT_TIMER's NOTE_MACHTIME|NOTE_ABSOLUTE deadlines
+ * (sys/event.h:575). Elsewhere CLOCK_MONOTONIC, and gettimeofday() only when
+ * neither exists. The value is never {0,0}: IS_ZERO() marks a timer that is
+ * running its callback.
+ */
+#ifdef __APPLE__
+static mach_timebase_info_data_t mono_tb;
+
+static void monoInit(void)
+{
+	if (mono_tb.denom == 0)
+		mach_timebase_info(&mono_tb);
+}
+
+/* a * n / d without a 128-bit intermediate (libgcc's __udivti3 is not linked here) */
+static uint64_t mulDiv(uint64_t a, uint32_t n, uint32_t d)
+{
+	return (a / d) * n + (a % d) * n / d;
+}
+
+static uint64_t absToNs(uint64_t a)
+{
+	monoInit();
+	return mulDiv(a, mono_tb.numer, mono_tb.denom);
+}
+#endif
+
 static void rightNow(struct timeval *tv)
 {
+#ifdef __APPLE__
+	uint64_t ns = absToNs(mach_absolute_time());
+
+	tv->tv_sec = ns / 1000000000ULL;
+	tv->tv_usec = (ns % 1000000000ULL) / 1000;
+#elif defined(CLOCK_MONOTONIC)
+	struct timespec ts;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+		tv->tv_sec = ts.tv_sec;
+		tv->tv_usec = ts.tv_nsec / 1000;
+	} else {
+		X_GETTIMEOFDAY(tv);
+	}
+#else
 	X_GETTIMEOFDAY(tv);
+#endif
+	if (tv->tv_sec == 0 && tv->tv_usec == 0)
+		tv->tv_usec = 1;
 }
 
 /* is t1 after t2 ? */
@@ -130,7 +192,51 @@ static void delayUntilNextTimerEvent(struct timeval *delay)
 	}
 }
 
+/*
+ * The next wake-up window: *soft is the earliest deadline, *hard the
+ * earliest of (deadline + leeway) over all pending timers, so that no timer
+ * is held past its own leeway. Returns 0 if no timer is pending (timers
+ * whose callback is running have a zero `when` and do not count).
+ */
+static int nextTimerWindow(struct timeval *soft, struct timeval *hard)
+{
+	TimerHandler *h = timerHandler;
+
+	while (h && IS_ZERO(h->when))
+		h = h->next;
+	if (!h)
+		return 0;
+
+	*soft = h->when;
+	*hard = h->when;
+	addmillisecs(hard, h->leeway);
+	for (h = h->next; h; h = h->next) {
+		struct timeval t;
+
+		if (IS_ZERO(h->when))
+			continue;
+		t = h->when;
+		addmillisecs(&t, h->leeway);
+		if (IS_AFTER(*hard, t))
+			*hard = t;
+	}
+	return 1;
+}
+
+/* Default leeway: 10% of the interval, at most 50 ms. */
+static int defaultLeeway(int milliseconds)
+{
+	int l = milliseconds / 10;
+
+	return l > 50 ? 50 : (l < 0 ? 0 : l);
+}
+
 WMHandlerID WMAddTimerHandler(int milliseconds, WMCallback * callback, void *cdata)
+{
+	return WMAddTimerHandlerWithLeeway(milliseconds, defaultLeeway(milliseconds), callback, cdata);
+}
+
+WMHandlerID WMAddTimerHandlerWithLeeway(int milliseconds, int leewayMs, WMCallback * callback, void *cdata)
 {
 	TimerHandler *handler;
 
@@ -143,6 +249,7 @@ WMHandlerID WMAddTimerHandler(int milliseconds, WMCallback * callback, void *cda
 	handler->callback = callback;
 	handler->clientData = cdata;
 	handler->nextDelay = 0;
+	handler->leeway = leewayMs < 0 ? 0 : leewayMs;
 
 	enqueueTimerHandler(handler);
 
@@ -151,7 +258,12 @@ WMHandlerID WMAddTimerHandler(int milliseconds, WMCallback * callback, void *cda
 
 WMHandlerID WMAddPersistentTimerHandler(int milliseconds, WMCallback * callback, void *cdata)
 {
-	TimerHandler *handler = WMAddTimerHandler(milliseconds, callback, cdata);
+	return WMAddPersistentTimerHandlerWithLeeway(milliseconds, defaultLeeway(milliseconds), callback, cdata);
+}
+
+WMHandlerID WMAddPersistentTimerHandlerWithLeeway(int milliseconds, int leewayMs, WMCallback * callback, void *cdata)
+{
+	TimerHandler *handler = WMAddTimerHandlerWithLeeway(milliseconds, leewayMs, callback, cdata);
 
 	if (handler != NULL)
 		handler->nextDelay = milliseconds;
@@ -312,6 +424,16 @@ static int kq_xfd = -1;		/* the extra fd (X connection) */
 static int kq_atfork_done = 0;
 static WMArray *kq_filters = NULL;
 static char kq_fd_tag;		/* udata of every fd-input registration */
+#ifndef WM_KQ_TIMER
+# define KQ_IS_TIMER_TAG(p)	0
+#else
+# define KQ_IS_TIMER_TAG(p)	((void *)(p) == (void *)&kq_timer_tag)
+static char kq_timer_tag;	/* udata of the timer-queue EVFILT_TIMER */
+static int kq_timer_ok = 1;	/* 0: unsupported here, use the kevent() timeout */
+static int kq_timer_armed;	/* a knote for (kq_timer_deadline, kq_timer_leeway) exists */
+static uint64_t kq_timer_deadline, kq_timer_leeway;
+static unsigned long stat_timer_arms, stat_timer_wakes;
+#endif
 
 static void kq_disable(void)
 {
@@ -319,6 +441,9 @@ static void kq_disable(void)
 		close(kq_fd);
 	kq_fd = -1;
 	kq_disabled = 1;
+#ifdef WM_KQ_TIMER
+	kq_timer_armed = 0;
+#endif
 }
 
 static int kq_change(uintptr_t ident, int16_t filter, uint16_t flags, uint32_t fflags, void *udata)
@@ -376,6 +501,9 @@ static void kq_forked_child(void)
 {
 	/* the kernel did not copy the kqueue into the child (see above) */
 	kq_fd = -1;
+#ifdef WM_KQ_TIMER
+	kq_timer_armed = 0;
+#endif
 }
 
 /* Create the kqueue on first use. Returns 1 if the kqueue backend is live. */
@@ -401,6 +529,9 @@ static int kq_init(void)
 		return 0;
 	}
 	fcntl(kq_fd, F_SETFD, FD_CLOEXEC);
+#ifdef WM_KQ_TIMER
+	kq_timer_armed = 0;
+#endif
 
 	if (!kq_atfork_done) {
 		kq_atfork_done = 1;
@@ -463,12 +594,122 @@ void W_KQueueDeleteFilter(W_KQueueID id)
 	WMRemoveFromArray(kq_filters, f);
 }
 
+#ifdef WM_KQ_TIMER
+/*
+ * The timer queue on the kernel's timer (DAR-432)
+ * -----------------------------------------------
+ * One EVFILT_TIMER knote stands for the whole queue: it is armed for the
+ * queue's next wake-up window (nextTimerWindow) and kevent() then blocks
+ * with no timeout. Why, and what it needs:
+ *  - NOTE_MACHTIME|NOTE_ABSOLUTE: `data` is a deadline in mach_absolute_time
+ *    units (sys/event.h:568-576; filt_timervalidate, kern_event.c:1312-1313,
+ *    1368-1369), the clock rightNow() uses. NOTE_ABSOLUTE makes it a one-shot
+ *    (filt_timerattach, kern_event.c:1631-1633), so it is re-armed after each
+ *    delivery. A deadline in the past fires at once (filt_timer_is_ready).
+ *  - NOTE_LEEWAY: ext[1] is the leeway in the same units (kern_event.c:
+ *    1348-1363). filt_timerarm passes it to thread_call_enter_delayed_with_
+ *    leeway (kern_event.c:1574), which uses max(leeway, the default slop of
+ *    the thread's QoS tier) as the coalescing slop and sets the hard
+ *    deadline to deadline + slop (thread_call.c:1223-1232). The kernel then
+ *    wakes us at the hard deadline unless some other timer wakes the CPU
+ *    first; that is what lets idle wake-ups coalesce. Leeway here is
+ *    (earliest hard deadline - earliest soft deadline), so no timer is
+ *    delayed past its own leeway.
+ *  - The kevent() TIMEOUT cannot do this: kqueue_scan waits with
+ *    TIMEOUT_NO_LEEWAY (kern_event.c:7510-7512). That timeout stays as the
+ *    fallback if the knote cannot be registered.
+ * Changing the registered deadline/leeway is a touch of the same knote
+ * (filt_timertouch, kern_event.c:1665-1698), so re-arming needs no delete.
+ *
+ * The leeway field is ext[1], which only kevent64()/kevent_qos() can pass
+ * (legacy kevent() zeroes it). This port's libsystem_kernel exports neither,
+ * so the syscall (kevent64, bsd/kern/syscalls.master:560) is made directly:
+ * arm64 Darwin takes the number in x16 and `svc #0x80`; carry set means
+ * failure with errno in x0. The changelist has one entry and no eventlist.
+ */
+static int kq_timer_syscall(int kq, const struct kevent64_s *change)
+{
+	register long x0 __asm__("x0") = kq;
+	register long x1 __asm__("x1") = (long)change;
+	register long x2 __asm__("x2") = 1;
+	register long x3 __asm__("x3") = 0;
+	register long x4 __asm__("x4") = 0;
+	register long x5 __asm__("x5") = 0;
+	register long x6 __asm__("x6") = 0;
+	register long x16 __asm__("x16") = SYS_kevent64;
+	unsigned long failed;
+
+	__asm__ volatile ("svc #0x80\n\tcset %0, cs"
+			  : "=r" (failed), "+r" (x0), "+r" (x1)
+			  : "r" (x2), "r" (x3), "r" (x4), "r" (x5), "r" (x6), "r" (x16)
+			  : "memory", "cc");
+	return failed ? -1 : 0;
+}
+
+static uint64_t timevalToAbs(const struct timeval *tv)
+{
+	uint64_t ns = (uint64_t)tv->tv_sec * 1000000000ULL + (uint64_t)tv->tv_usec * 1000ULL;
+
+	monoInit();
+	return mulDiv(ns, mono_tb.denom, mono_tb.numer);
+}
+
+/*
+ * Arm the queue's knote for the next window. Returns 1 if it is armed (the
+ * caller blocks with no timeout), 0 if not (no pending timer, or the kernel
+ * refused: use the timeout). Only issues a syscall when the window changed.
+ */
+static int kq_timer_arm(void)
+{
+	struct timeval soft, hard;
+	struct kevent64_s ev;
+	uint64_t deadline, hardAbs, leeway;
+
+	if (!kq_timer_ok || !nextTimerWindow(&soft, &hard))
+		return 0;
+
+	deadline = timevalToAbs(&soft);
+	hardAbs = timevalToAbs(&hard);
+	leeway = hardAbs > deadline ? hardAbs - deadline : 0;
+	if (kq_timer_armed && deadline == kq_timer_deadline && leeway == kq_timer_leeway)
+		return 1;
+
+	memset(&ev, 0, sizeof ev);
+	ev.ident = 1;
+	ev.filter = EVFILT_TIMER;
+	ev.flags = EV_ADD | EV_ENABLE;
+	ev.fflags = NOTE_MACHTIME | NOTE_ABSOLUTE | NOTE_LEEWAY;
+	ev.data = (int64_t)deadline;
+	ev.udata = (uint64_t)(uintptr_t)&kq_timer_tag;
+	ev.ext[1] = leeway;
+	if (kq_timer_syscall(kq_fd, &ev) < 0) {
+		kq_timer_ok = 0;
+		kq_timer_armed = 0;
+		return 0;
+	}
+	kq_timer_armed = 1;
+	kq_timer_deadline = deadline;
+	kq_timer_leeway = leeway;
+	stat_timer_arms++;
+	return 1;
+}
+
+/* No timer is pending any more: stop a knote that would only cause a spurious wake-up. */
+static void kq_timer_disarm(void)
+{
+	if (kq_timer_armed) {
+		kq_change(1, EVFILT_TIMER, EV_DELETE, 0, NULL);
+		kq_timer_armed = 0;
+	}
+}
+#endif /* WM_KQ_TIMER */
+
 /* Returns -1 if the backend is unavailable (caller uses select). */
 static int kq_handleInputEvents(Bool waitForInput, int inputfd)
 {
 	struct kevent evs[KQ_MAXEVENTS];
 	struct timespec ts, *tsp;
-	int nfds, nfilters, n, i, j;
+	int nfds, nfilters, n, nevents, i, j;
 
 	if (!kq_init())
 		return -1;
@@ -495,16 +736,37 @@ static int kq_handleInputEvents(Bool waitForInput, int inputfd)
 		ts.tv_nsec = 0;
 		tsp = &ts;
 	} else if (timerPending()) {
-		struct timeval tv;
-		delayUntilNextTimerEvent(&tv);
-		ts.tv_sec = tv.tv_sec;
-		ts.tv_nsec = tv.tv_usec * 1000;
-		tsp = &ts;
+#ifdef WM_KQ_TIMER
+		if (kq_timer_arm()) {
+			tsp = NULL;	/* the knote is the timeout */
+		} else
+#endif
+		{
+			struct timeval tv;
+			delayUntilNextTimerEvent(&tv);
+			ts.tv_sec = tv.tv_sec;
+			ts.tv_nsec = tv.tv_usec * 1000;
+			tsp = &ts;
+		}
 	} else {
+#ifdef WM_KQ_TIMER
+		kq_timer_disarm();
+#endif
 		tsp = NULL;
 	}
 
 	n = kevent(kq_fd, NULL, 0, evs, KQ_MAXEVENTS, tsp);
+	nevents = n;
+#ifdef WM_KQ_TIMER
+	/* the queue's knote is one-shot: it is gone once delivered. It is not input. */
+	for (i = 0; i < n; i++) {
+		if (evs[i].udata == &kq_timer_tag) {
+			kq_timer_armed = 0;
+			stat_timer_wakes++;
+			nevents--;
+		}
+	}
+#endif
 
 	if (n > 0) {
 		/* input handlers first, through a copy, as the select path does */
@@ -539,7 +801,7 @@ static int kq_handleInputEvents(Bool waitForInput, int inputfd)
 		for (j = 0; j < n; j++) {
 			KQFilter *f = evs[j].udata;
 
-			if (f == (KQFilter *) &kq_fd_tag || !kq_filters ||
+			if (f == (KQFilter *) &kq_fd_tag || KQ_IS_TIMER_TAG(f) || !kq_filters ||
 			    WMGetFirstInArray(kq_filters, f) == WANotFound)
 				continue;
 			if (f->proc)
@@ -552,7 +814,7 @@ static int kq_handleInputEvents(Bool waitForInput, int inputfd)
 
 	W_FlushASAPNotificationQueue();
 
-	return (n > 0);
+	return (nevents > 0);
 }
 #else /* !WM_USE_KQUEUE */
 
@@ -641,6 +903,28 @@ Bool W_CheckIdleHandlers(void)
 	return (WMGetArrayItemCount(idleHandler) > 0);
 }
 
+/*
+ * WM_EVENT_STATS also counts how often each timer callback runs (first 16
+ * distinct callbacks), printed as image+offset so they can be looked up
+ * with nm in the unstripped binary: which timers are alive on an idle
+ * desktop (DAR-432).
+ */
+static int stat_enabled = -1;	/* -1: not read yet; WM_EVENT_STATS */
+static struct { void *cb; unsigned long n; } timer_fires[16];
+
+static void countTimerFire(void *cb)
+{
+	int i;
+
+	for (i = 0; i < 16; i++) {
+		if (timer_fires[i].cb == cb || timer_fires[i].cb == NULL) {
+			timer_fires[i].cb = cb;
+			timer_fires[i].n++;
+			return;
+		}
+	}
+}
+
 void W_CheckTimerHandlers(void)
 {
 	TimerHandler *handler;
@@ -657,6 +941,8 @@ void W_CheckTimerHandlers(void)
 	while (handler && IS_AFTER(now, handler->when)) {
 		if (!IS_ZERO(handler->when)) {
 			SET_ZERO(handler->when);
+			if (stat_enabled > 0)
+				countTimerFire((void *)handler->callback);
 			(*handler->callback) (handler->clientData);
 		}
 		handler = handler->next;
@@ -916,14 +1202,35 @@ static Bool handleInputEventsSelect(Bool waitForInput, int inputfd)
  * time() call is made only when N > 1.
  */
 static unsigned long stat_waits, stat_woke;	/* blocking waits, returns with input */
-static int stat_enabled = -1, stat_interval;
+static int stat_interval;
 static time_t stat_last;
 static const char *stat_backend = "select";
 
 static void printStats(void)
 {
+	int i;
+
+	for (i = 0; i < 16 && timer_fires[i].cb; i++) {
+#ifdef __APPLE__
+		Dl_info di;
+
+		if (dladdr(timer_fires[i].cb, &di) && di.dli_fbase)
+			fprintf(stderr, "WUtil timer callback %s+0x%lx (%s) fired %lu\n",
+				di.dli_fname, (unsigned long)((char *)timer_fires[i].cb - (char *)di.dli_fbase),
+				di.dli_sname ? di.dli_sname : "?", timer_fires[i].n);
+		else
+#endif
+			fprintf(stderr, "WUtil timer callback %p fired %lu\n", timer_fires[i].cb, timer_fires[i].n);
+	}
+#ifdef WM_KQ_TIMER
+	fprintf(stderr, "WUtil event stats: t=%ld backend=%s blocking_waits=%lu with_input=%lu "
+		"ktimer=%s timer_arms=%lu timer_wakes=%lu\n",
+		(long)time(NULL), stat_backend, stat_waits, stat_woke,
+		kq_timer_ok ? "on" : "off", stat_timer_arms, stat_timer_wakes);
+#else
 	fprintf(stderr, "WUtil event stats: t=%ld backend=%s blocking_waits=%lu with_input=%lu\n",
 		(long)time(NULL), stat_backend, stat_waits, stat_woke);
+#endif
 }
 
 static void periodicStats(void)
