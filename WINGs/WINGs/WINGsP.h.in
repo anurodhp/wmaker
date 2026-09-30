@@ -371,6 +371,20 @@ void W_CheckTimerHandlers(void);
 
 Bool W_HandleInputEvents(Bool waitForInput, int inputfd);
 
+/*
+ * Register another kqueue filter (timer, vnode, proc, ...) on the WUtil
+ * kqueue (DAR-431). proc runs from W_HandleInputEvents() in the same
+ * batch as input handlers. Returns NULL if the kqueue backend is not in
+ * use (built without WM_USE_KQUEUE, WM_EVENT_BACKEND=select, or kqueue()
+ * failed): the caller must then use its own fallback. kev->udata is
+ * replaced. Delete with W_KQueueDeleteFilter().
+ */
+struct kevent;
+typedef void W_KQueueProc(const struct kevent *ev, void *clientData);
+typedef void *W_KQueueID;
+W_KQueueID W_KQueueAddFilter(const struct kevent *kev, W_KQueueProc *proc, void *clientData);
+void W_KQueueDeleteFilter(W_KQueueID id);
+
 
 /* ---[ notification.c ]-------------------------------------------------- */
 

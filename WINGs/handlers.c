@@ -17,6 +17,14 @@
 
 #include <time.h>
 
+#ifdef WM_USE_KQUEUE
+# include <sys/event.h>
+# include <fcntl.h>
+# include <errno.h>
+# include <string.h>
+# include <pthread.h>
+#endif
+
 #ifndef X_GETTIMEOFDAY
 #define X_GETTIMEOFDAY(t) gettimeofday(t, (struct timezone*)0)
 #endif
@@ -239,6 +247,325 @@ void WMDeleteIdleHandler(WMHandlerID handlerID)
 	WMRemoveFromArray(idleHandler, handler);
 }
 
+#ifdef WM_USE_KQUEUE
+/*
+ * kqueue backend for the input wait (DAR-431)
+ * -------------------------------------------
+ * One kqueue, owned by this file, is the single place the process blocks.
+ * It replaces the per-wakeup FD_ZERO/FD_SET rebuild and select() of
+ * handleInputEventsSelect() below, which stays as the runtime fallback
+ * (kqueue() failing, a registration failing for a reason other than a bad
+ * fd, or WM_EVENT_BACKEND=select in the environment).
+ *
+ * Semantics kept from the select path:
+ *  - Level-triggered. Registrations never use EV_CLEAR, so kevent()
+ *    reports an fd for as long as it is ready, exactly like select().
+ *    For EVFILT_READ on a socket the filter re-evaluates the socket
+ *    buffer on every scan (xnu bsd/kern/uipc_socket.c filt_soread). This
+ *    is what makes Xlib safe: waitForEvent() (wevent.c) only gets here
+ *    after XPending()/XCheckMaskEvent() found nothing in Xlib's queue, and
+ *    if the X socket holds unread bytes kevent() returns at once.
+ *  - EINTR: kevent() never restarts after a signal, even with SA_RESTART
+ *    (xnu bsd/kern/kern_event.c kevent_internal: "don't restart after
+ *    signals...", ERESTART -> EINTR). wmaker's handlers use SA_RESTART
+ *    (src/startup.c:527,546), so this matches select(), which also
+ *    returns EINTR; the loop returns False and WMNextEvent goes round.
+ *  - Timeout comes from the same timer queue as before.
+ *  - A handler deleted by an earlier callback in the same batch does not
+ *    fire: dispatch works on a copy of the handler array and checks
+ *    membership, as the select path does.
+ *
+ * Registration model: per fd, the wanted filters are the union of all
+ * handlers on that fd (WIReadMask->EVFILT_READ, WIWriteMask->EVFILT_WRITE,
+ * WIExceptMask->EVFILT_EXCEPT+NOTE_OOB, event.h:433-434) plus the read
+ * filter for the extra fd passed by wevent.c (ConnectionNumber(dpy)). The
+ * kernel drops a knote when its fd is closed (kern_descrip.c:3414
+ * knote_fdclose), so a handler whose fd was closed without being deleted
+ * just never fires; select() would have returned EBADF forever.
+ *
+ * Fork: xnu marks a kqueue fd UF_EXCLOSE|UF_FORKCLOSE (kern_event.c:3025),
+ * so a forked child has no kqueue. A pthread_atfork child hook forgets the
+ * fd; the next wait creates a new kqueue and re-registers everything.
+ *
+ * Extension point for other filters (DAR-432 timers, DAR-433 vnode
+ * watches, child exits): W_KQueueAddFilter()/W_KQueueDeleteFilter().
+ * Such a filter's udata is its KQFilter; the callback runs from the same
+ * wait, on the same thread, in the same batch as input handlers. They
+ * need no change to the wait itself. They are lost if the backend falls
+ * back to select, so each user keeps its own timer/poll fallback and
+ * checks W_KQueueAddFilter() != NULL. The timeout passed to kevent()
+ * is still computed from the timer queue, so DAR-432 can either keep
+ * that and only swap the clock, or arm an EVFILT_TIMER here and pass a
+ * NULL timeout.
+ */
+#define KQ_MAXEVENTS 32
+
+typedef struct KQFilter {
+	struct kevent kev;
+	W_KQueueProc *proc;
+	void *clientData;
+} KQFilter;
+
+static int kq_fd = -1;
+static int kq_disabled = 0;	/* 1: use the select path */
+static int kq_xfd = -1;		/* the extra fd (X connection) */
+static int kq_atfork_done = 0;
+static WMArray *kq_filters = NULL;
+static char kq_fd_tag;		/* udata of every fd-input registration */
+
+static void kq_disable(void)
+{
+	if (kq_fd >= 0)
+		close(kq_fd);
+	kq_fd = -1;
+	kq_disabled = 1;
+}
+
+static int kq_change(uintptr_t ident, int16_t filter, uint16_t flags, uint32_t fflags, void *udata)
+{
+	struct kevent ev;
+
+	EV_SET(&ev, ident, filter, flags, fflags, 0, udata);
+	return kevent(kq_fd, &ev, 1, NULL, 0, NULL);
+}
+
+/*
+ * Make the registrations for fd match the handlers (plus xfd). Filters no
+ * longer wanted are only deleted when 'removing' (a handler was deleted),
+ * so adding costs one syscall per wanted filter and nothing else.
+ */
+static void kq_sync_fd(int fd, int removing)
+{
+	int want = 0, i, n = inputHandler ? WMGetArrayItemCount(inputHandler) : 0;
+
+	if (fd < 0)
+		return;
+	for (i = 0; i < n; i++) {
+		InputHandler *h = WMGetFromArray(inputHandler, i);
+		if (h->fd == fd)
+			want |= h->mask;
+	}
+	if (fd == kq_xfd)
+		want |= WIReadMask;
+
+	if (want & WIReadMask) {
+		if (kq_change(fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, &kq_fd_tag) < 0 && errno != EBADF)
+			kq_disable();
+	} else if (removing) {
+		kq_change(fd, EVFILT_READ, EV_DELETE, 0, NULL);	/* ENOENT is fine */
+	}
+	if (kq_fd < 0)
+		return;
+	if (want & WIWriteMask) {
+		if (kq_change(fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, &kq_fd_tag) < 0 && errno != EBADF)
+			kq_disable();
+	} else if (removing) {
+		kq_change(fd, EVFILT_WRITE, EV_DELETE, 0, NULL);
+	}
+	if (kq_fd < 0)
+		return;
+	if (want & WIExceptMask) {
+		if (kq_change(fd, EVFILT_EXCEPT, EV_ADD | EV_ENABLE, NOTE_OOB, &kq_fd_tag) < 0 && errno != EBADF)
+			kq_disable();
+	} else if (removing) {
+		kq_change(fd, EVFILT_EXCEPT, EV_DELETE, 0, NULL);
+	}
+}
+
+static void kq_forked_child(void)
+{
+	/* the kernel did not copy the kqueue into the child (see above) */
+	kq_fd = -1;
+}
+
+/* Create the kqueue on first use. Returns 1 if the kqueue backend is live. */
+static int kq_init(void)
+{
+	int i, n;
+	const char *env;
+
+	if (kq_fd >= 0)
+		return 1;
+	if (kq_disabled)
+		return 0;
+
+	env = getenv("WM_EVENT_BACKEND");
+	if (env && strcmp(env, "select") == 0) {
+		kq_disabled = 1;
+		return 0;
+	}
+
+	kq_fd = kqueue();
+	if (kq_fd < 0) {
+		kq_disabled = 1;
+		return 0;
+	}
+	fcntl(kq_fd, F_SETFD, FD_CLOEXEC);
+
+	if (!kq_atfork_done) {
+		kq_atfork_done = 1;
+		pthread_atfork(NULL, NULL, kq_forked_child);
+	}
+
+	/* first use, or first use after fork: register everything known */
+	n = inputHandler ? WMGetArrayItemCount(inputHandler) : 0;
+	for (i = 0; i < n && kq_fd >= 0; i++)
+		kq_sync_fd(((InputHandler *) WMGetFromArray(inputHandler, i))->fd, 0);
+	if (kq_fd >= 0 && kq_xfd >= 0)
+		kq_sync_fd(kq_xfd, 0);
+	n = kq_filters ? WMGetArrayItemCount(kq_filters) : 0;
+	for (i = 0; i < n && kq_fd >= 0; i++) {
+		KQFilter *f = WMGetFromArray(kq_filters, i);
+		/* a failure here is that filter's owner's problem: it polls as before */
+		(void) kq_change(f->kev.ident, f->kev.filter, f->kev.flags | EV_ADD, f->kev.fflags, f);
+	}
+
+	return kq_fd >= 0;
+}
+
+W_KQueueID W_KQueueAddFilter(const struct kevent *kev, W_KQueueProc *proc, void *clientData)
+{
+	KQFilter *f;
+	struct kevent ev;
+
+	if (!kq_init())
+		return NULL;
+
+	f = wmalloc(sizeof(KQFilter));
+	f->kev = *kev;
+	f->proc = proc;
+	f->clientData = clientData;
+
+	ev = *kev;
+	ev.flags |= EV_ADD;
+	ev.udata = f;
+	if (kevent(kq_fd, &ev, 1, NULL, 0, NULL) < 0) {
+		wfree(f);
+		return NULL;
+	}
+	f->kev.udata = f;
+
+	if (!kq_filters)
+		kq_filters = WMCreateArrayWithDestructor(8, wfree);
+	WMAddToArray(kq_filters, f);
+
+	return f;
+}
+
+void W_KQueueDeleteFilter(W_KQueueID id)
+{
+	KQFilter *f = id;
+
+	if (!f || !kq_filters || WMGetFirstInArray(kq_filters, f) == WANotFound)
+		return;
+	if (kq_fd >= 0)
+		kq_change(f->kev.ident, f->kev.filter, EV_DELETE, 0, NULL);
+	WMRemoveFromArray(kq_filters, f);
+}
+
+/* Returns -1 if the backend is unavailable (caller uses select). */
+static int kq_handleInputEvents(Bool waitForInput, int inputfd)
+{
+	struct kevent evs[KQ_MAXEVENTS];
+	struct timespec ts, *tsp;
+	int nfds, nfilters, n, i, j;
+
+	if (!kq_init())
+		return -1;
+
+	nfds = inputHandler ? WMGetArrayItemCount(inputHandler) : 0;
+	nfilters = kq_filters ? WMGetArrayItemCount(kq_filters) : 0;
+
+	if (inputfd < 0 && nfds == 0 && nfilters == 0) {
+		W_FlushASAPNotificationQueue();
+		return False;
+	}
+
+	if (inputfd != kq_xfd) {
+		int old = kq_xfd;
+		kq_xfd = inputfd;
+		kq_sync_fd(old, 1);
+		kq_sync_fd(inputfd, 0);
+		if (kq_fd < 0)
+			return -1;	/* a registration failed: select from now on */
+	}
+
+	if (!waitForInput) {
+		ts.tv_sec = 0;
+		ts.tv_nsec = 0;
+		tsp = &ts;
+	} else if (timerPending()) {
+		struct timeval tv;
+		delayUntilNextTimerEvent(&tv);
+		ts.tv_sec = tv.tv_sec;
+		ts.tv_nsec = tv.tv_usec * 1000;
+		tsp = &ts;
+	} else {
+		tsp = NULL;
+	}
+
+	n = kevent(kq_fd, NULL, 0, evs, KQ_MAXEVENTS, tsp);
+
+	if (n > 0) {
+		/* input handlers first, through a copy, as the select path does */
+		if (nfds > 0) {
+			WMArray *handlerCopy = WMDuplicateArray(inputHandler);
+
+			for (i = 0; i < nfds; i++) {
+				InputHandler *handler = WMGetFromArray(handlerCopy, i);
+				int mask = 0;
+
+				if (WMGetFirstInArray(inputHandler, handler) == WANotFound)
+					continue;
+
+				for (j = 0; j < n; j++) {
+					if (evs[j].udata != &kq_fd_tag || (int)evs[j].ident != handler->fd)
+						continue;
+					if (evs[j].filter == EVFILT_READ && (handler->mask & WIReadMask))
+						mask |= WIReadMask;
+					else if (evs[j].filter == EVFILT_WRITE && (handler->mask & WIWriteMask))
+						mask |= WIWriteMask;
+					else if (evs[j].filter == EVFILT_EXCEPT && (handler->mask & WIExceptMask))
+						mask |= WIExceptMask;
+				}
+
+				if (mask != 0 && handler->callback)
+					(*handler->callback) (handler->fd, mask, handler->clientData);
+			}
+			WMFreeArray(handlerCopy);
+		}
+
+		/* then other filters; one may have been deleted by an earlier callback */
+		for (j = 0; j < n; j++) {
+			KQFilter *f = evs[j].udata;
+
+			if (f == (KQFilter *) &kq_fd_tag || !kq_filters ||
+			    WMGetFirstInArray(kq_filters, f) == WANotFound)
+				continue;
+			if (f->proc)
+				(*f->proc) (&evs[j], f->clientData);
+			if ((f->kev.flags & EV_ONESHOT) && kq_filters &&
+			    WMGetFirstInArray(kq_filters, f) != WANotFound)
+				WMRemoveFromArray(kq_filters, f);
+		}
+	}
+
+	W_FlushASAPNotificationQueue();
+
+	return (n > 0);
+}
+#else /* !WM_USE_KQUEUE */
+
+W_KQueueID W_KQueueAddFilter(const struct kevent *kev, W_KQueueProc *proc, void *clientData)
+{
+	return NULL;
+}
+
+void W_KQueueDeleteFilter(W_KQueueID id)
+{
+}
+#endif /* WM_USE_KQUEUE */
+
 WMHandlerID WMAddInputHandler(int fd, int condition, WMInputProc * proc, void *clientData)
 {
 	InputHandler *handler;
@@ -254,6 +581,12 @@ WMHandlerID WMAddInputHandler(int fd, int condition, WMInputProc * proc, void *c
 		inputHandler = WMCreateArrayWithDestructor(16, wfree);
 	WMAddToArray(inputHandler, handler);
 
+#ifdef WM_USE_KQUEUE
+	/* if the kqueue already exists register now, else kq_init() does it */
+	if (kq_fd >= 0)
+		kq_sync_fd(fd, 0);
+#endif
+
 	return handler;
 }
 
@@ -264,7 +597,17 @@ void WMDeleteInputHandler(WMHandlerID handlerID)
 	if (!handler || !inputHandler)
 		return;
 
+#ifdef WM_USE_KQUEUE
+	{
+		/* the array destructor frees the handler, so keep the fd */
+		int fd = handler->fd;
+		WMRemoveFromArray(inputHandler, handler);
+		if (kq_fd >= 0)
+			kq_sync_fd(fd, 1);
+	}
+#else
 	WMRemoveFromArray(inputHandler, handler);
+#endif
 }
 
 Bool W_CheckIdleHandlers(void)
@@ -369,7 +712,7 @@ void W_CheckTimerHandlers(void)
  *   inputfd = -1
  *
  */
-Bool W_HandleInputEvents(Bool waitForInput, int inputfd)
+static Bool handleInputEventsSelect(Bool waitForInput, int inputfd)
 {
 #if defined(HAVE_POLL) && defined(HAVE_POLL_H) && !defined(HAVE_SELECT)
 	struct poll fd *fds;
@@ -563,4 +906,72 @@ Bool W_HandleInputEvents(Bool waitForInput, int inputfd)
 # error   Neither select nor poll. You lose.
 #endif				/* HAVE_SELECT */
 #endif				/* HAVE_POLL */
+}
+
+/*
+ * WM_EVENT_STATS=N: count blocking waits and print the totals to stderr at
+ * exit, and at most every N seconds (N > 1) from inside the wait, so idle
+ * wakeups can be compared between the backends
+ * (WM_EVENT_BACKEND=select|kqueue). Two integer increments per wait; the
+ * time() call is made only when N > 1.
+ */
+static unsigned long stat_waits, stat_woke;	/* blocking waits, returns with input */
+static int stat_enabled = -1, stat_interval;
+static time_t stat_last;
+static const char *stat_backend = "select";
+
+static void printStats(void)
+{
+	fprintf(stderr, "WUtil event stats: backend=%s blocking_waits=%lu with_input=%lu\n",
+		stat_backend, stat_waits, stat_woke);
+}
+
+static void periodicStats(void)
+{
+	time_t t = time(NULL);
+
+	if (stat_interval > 1 && t - stat_last >= stat_interval) {
+		stat_last = t;
+		printStats();
+	}
+}
+
+Bool W_HandleInputEvents(Bool waitForInput, int inputfd)
+{
+	Bool r;
+
+	if (stat_enabled < 0) {
+		const char *e = getenv("WM_EVENT_STATS");
+
+		stat_enabled = e != NULL;
+		if (stat_enabled) {
+			stat_interval = atoi(e);
+			atexit(printStats);
+		}
+	}
+#ifdef WM_USE_KQUEUE
+	{
+		int k = kq_handleInputEvents(waitForInput, inputfd);
+
+		if (k >= 0) {
+			if (stat_enabled) {
+				stat_backend = "kqueue";
+				if (waitForInput) {
+					stat_waits++;
+					stat_woke += k;
+					periodicStats();
+				}
+			}
+			return k;
+		}
+	}
+#endif
+	r = handleInputEventsSelect(waitForInput, inputfd);
+	if (stat_enabled && waitForInput) {
+		stat_backend = "select";
+		stat_waits++;
+		stat_woke += r;
+		periodicStats();
+	}
+	return r;
 }
