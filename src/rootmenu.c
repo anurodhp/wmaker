@@ -1611,6 +1611,11 @@ void OpenRootMenu(WScreen * scr, int x, int y, int keyboard)
 	}
 
 	definition = w_global.domain.root_menu->dictionary;
+	if (getenv("WM_DEFAULTS_TRACE")) {	/* DAR-433 testing: what the menu code sees, see defaults.c trace() */
+		char *d = definition ? WMGetPropListDescription(definition, False) : NULL;
+		fprintf(stderr, "defaults-trace OpenRootMenu dom_ts=%ld scr_menu=%p scr_ts=%ld def=%.60s\n", (long)w_global.domain.root_menu->timestamp,
+			(void *)scr->root_menu, scr->root_menu ? (long)scr->root_menu->timestamp : -1L, d ? d : "(null)");
+	}
 
 	/*
 	   definition = PLGetDomain(domain);
