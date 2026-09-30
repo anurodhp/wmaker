@@ -24,6 +24,7 @@ boots); numbers for the real Pi are noted as pending where they have not been ta
 | kqueue-backed event loop instead of `select()` | this fork (DAR-431) | Done on QEMU, merged | No speed change by itself (see below); it gives one wait that the timer and file-watch tickets build on. |
 | Monotonic, coalesced timers (`NOTE_MACHTIME` + `NOTE_LEEWAY`) | this fork (DAR-432) | Done on QEMU | Timers survive `settimeofday()` steps. Idle wake-ups about 1.0 per second to about 0.35 per second; idle CPU about 0.9 s to about 0.35 s per 60 s (see below). |
 | `EVFILT_VNODE` watch of `~/GNUstep/Defaults` instead of 2 s `stat()` polling | this fork (DAR-433) | Done on QEMU | Idle wake-ups about 0.35 per second to about 0.03 per second; idle CPU about 0.4 s to about 0.06 s per 60 s; a changed defaults file is reloaded within about 0.2 s (see below). |
+| Main threads of Xorg and wmaker at `QOS_CLASS_USER_INTERACTIVE` | this fork, `src/main.c` (branch `dar-439-qos`), and the puredarwingop Xorg driver (PureDarwin fork branch `dar-439-qos`) (DAR-439 step 2) | Built, QEMU-measured, real Pi pending | Base priority 31 to 37 (not 46). QEMU, one core, under CPU hogs: 95th percentile window-move round trip 140-154 ms to 41-45 ms (4 hogs), 43 ms to 27-31 ms (1 hog). Idle median round trip rose about 11.5 ms to 14-19 ms. See section 6. |
 
 ### 1. Session priority (biggest user-visible win)
 
@@ -337,6 +338,51 @@ see section 5); elsewhere the poll stays. The guest's wall clock is stepped by c
 the test script stops it and sets file mtimes itself; real use is not affected by that, but as
 before a file with an mtime older than the last loaded one is only noticed if its inode or size
 differ. msdosfs and the real Pi are not measured.
+
+### 6. Main-thread QoS (DAR-439 step 2)
+
+Branch `dar-439-qos`. `main()` calls `pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)`
+first thing (Darwin only). Xorg's main thread does the same from the puredarwingop driver's module
+setup (`PDGOPSetup`, which runs on the main thread before probing), which logs
+`puredarwingop: main thread QoS set: rc=0, class now 0x21` to Xorg.0.log. Apps are not touched.
+
+**What the kernel does** (xnu-7195). The ticket expected base priority 46 (`thread_policy.c:74`,
+`sched.h:160`). That is the table value, but the session job is a DAEMON_INTERACTIVE task, and for
+daemons `task_policy.c:866-868` caps the task's QoS at USER_INITIATED, applied to every thread at
+`thread_policy.c:1554-1556`. So the thread goes from 31 (LEGACY, the daemon primordial QoS,
+`task_policy.c:2069-2074`) to 37 (`sched.h:162`). Measured with `thread_info` in the guest:
+`base_pri=31` before, `37` after, `pthread_get_qos_class_np` 0x15 to 0x21. A process cannot get 46
+from this job type: `ProcessType=App` was tried and only the job's own first process gets the app
+priority (47), its children (Xvfb, wmaker) are back at 31 and wmaker's own QoS call left it at 31.
+
+QoS set before `exec()` is lost (`kern_exec.c:4033`, `task_set_main_thread_qos`), so it has to be
+done inside the process.
+
+The timer claim holds on paper and cannot be seen on QEMU. `tcoal_qos_adjust`
+(`timer_call.c:1690`) maps USER_INTERACTIVE to latency tier 0 and LEGACY to tier 1
+(`thread_policy.c:106-109`); `arm_timer.c:279-285` gives tier 0 a coalescing window of at most 1 ms
+(shift 3) and tier 1 at most 5 ms (shift 2). `usleep(2000)` overshoots by about 2.1-2.3 ms with or
+without the QoS call on QEMU, so the emulated clock tick hides it.
+
+**QEMU measurements** (one core, `tools/wm_qos_verify_guest.sh`: Xvfb and wmaker started by a
+launchd job with `ProcessType=Interactive`; `wmlat rt 200`, round trip of an `XMoveWindow` through
+Xvfb and wmaker back to the client, median / 95th percentile in ms; the client stays at 31; two or
+three boots each, boot-to-boot noise is several ms):
+
+| Load | neither raised | only Xvfb | only wmaker | both |
+|---|---|---|---|---|
+| idle | 11.4 / 13.6 to 12.0 / 17.9 | 12.5 / 19.8 | 15.6 / 26.2 to 19.5 / 28.4 | 14.0 / 17.2 to 19.0 / 24.5 |
+| 1 `yes` | 11.5 / 43 | 13.2 / 31 | 17.5 / 40 to 20.6 / 45 | 15.7 / 27 to 19.8 / 31 |
+| 4 `yes` | 11.8 / 140 to 12.3 / 154 | 12.2 / 80 | 16.5 / 114 to 22.8 / 118 | 15.9 / 41 to 19.9 / 43 |
+| 1 `yes` at nice 20 | 11.1 / 42 to 11.5 / 46 | 10.8 / 30 | 19.6 / 36 to 21.9 / 48 | 15.9 / 26 to 19.6 / 33 |
+| 1 `yes` at USER_INTERACTIVE (37) | 153 / 265 | 295 / 392 | not run | 36 / 71 to 40 / 105 |
+
+Raising both cuts the tail under load by 40 to 70 percent and keeps a busy 37-priority peer from
+starving the UI; raising only one is worse than both (only wmaker: worst idle cost, small gain),
+which is the priority inversion the ticket warned about. Cost: the idle median is 3 to 7 ms
+higher (about 25 to 60 percent) with both raised. Cause not found; the test
+client stays at 31, and the loaded tail improves in the same runs. The real Pi is not measured;
+check `ps -o pid,pri,comm` (Xorg and wmaker 37, apps 31) and Xorg.0.log.
 
 ### Not yet measured on real hardware
 
