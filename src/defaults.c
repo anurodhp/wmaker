@@ -58,6 +58,7 @@
 #include "xmodifier.h"
 #include "icon.h"
 #include "main.h"
+#include <sys/time.h>
 #ifdef WM_USE_KQUEUE
 # include <sys/event.h>
 # include <fcntl.h>
@@ -1068,10 +1069,27 @@ static struct domainStat {
 	off_t size;
 } seenMaker, seenAttr, seenMenu;
 
+/* WM_DEFAULTS_TRACE=1 in the environment logs every reload and watch event (DAR-433 testing) */
+static void trace(const char *what, const char *name)
+{
+	static int on = -1;
+	struct timeval tv;
+
+	if (on < 0)
+		on = getenv("WM_DEFAULTS_TRACE") != NULL;
+	if (!on)
+		return;
+	gettimeofday(&tv, NULL);
+	fprintf(stderr, "defaults-trace %ld.%03d %s %s\n", (long)tv.tv_sec, (int)(tv.tv_usec / 1000), what, name);
+}
+
 static int domainChanged(const WDDomain *domain, const struct stat *st, struct domainStat *seen)
 {
 	int changed = domain->timestamp < st->st_mtime ||
 		      (seen->valid && (seen->ino != st->st_ino || seen->size != st->st_size));
+
+	if (changed)
+		trace("reload", domain->domain_name);
 
 	seen->valid = 1;
 	seen->ino = st->st_ino;
@@ -1331,8 +1349,8 @@ static void debounceFired(void *clientData)
 static void vnodeEvent(const struct kevent *ev, void *clientData)
 {
 	(void) ev;
-	(void) clientData;
 
+	trace("vnode-event", clientData ? ((Watch *)clientData)->path : "?");
 	if (!debounceTimer)
 		debounceTimer = WMAddTimerHandlerWithLeeway(WATCH_DEBOUNCE, WATCH_DEBOUNCE / 2, debounceFired, NULL);
 }
