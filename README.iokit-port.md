@@ -23,7 +23,7 @@ boots); numbers for the real Pi are noted as pending where they have not been ta
 | wrlib 32bpp TrueColor fast path and NEON blending | this fork, commit `1ef1522c` (DAR-437) | Done on QEMU, merged | `RConvertImage + XCopyArea` about 80 ms to about 58 ms per op; `RCombineImages` (RGB over RGB) about 12 ms to about 4 ms per op. |
 | kqueue-backed event loop instead of `select()` | this fork (DAR-431) | Done on QEMU, merged | No speed change by itself (see below); it gives one wait that the timer and file-watch tickets build on. |
 | Monotonic, coalesced timers (`NOTE_MACHTIME` + `NOTE_LEEWAY`) | this fork (DAR-432) | Done on QEMU | Timers survive `settimeofday()` steps. Idle wake-ups about 1.0 per second to about 0.35 per second; idle CPU about 0.9 s to about 0.35 s per 60 s (see below). |
-| `EVFILT_VNODE` watch of `~/GNUstep/Defaults` instead of 2 s `stat()` polling | this fork (DAR-433) | Planned, after DAR-431 | |
+| `EVFILT_VNODE` watch of `~/GNUstep/Defaults` instead of 2 s `stat()` polling | this fork (DAR-433) | Done on QEMU | Idle wake-ups about 0.35 per second to about 0.03 per second; idle CPU about 0.4 s to about 0.06 s per 60 s; a changed defaults file is reloaded within about 0.2 s (see below). |
 
 ### 1. Session priority (biggest user-visible win)
 
@@ -226,6 +226,117 @@ Caveats: the leeway knob is only as good as the kernel's coalescing (per-CPU tim
 timers may wake the CPU earlier, which fires our timers early but never before their deadline).
 The select fallback ignores leeway. The numbers are QEMU only; the real Pi is still to be
 measured.
+
+### 6. Defaults files watched with `EVFILT_VNODE` (this fork)
+
+Commits `ee0d4ae8` (the change), `5cea924f` (a bug it exposed), `77e15049` and `3fcdbf12`
+(`WM_DEFAULTS_TRACE`, see below). Darwin has no inotify, so `HAVE_INOTIFY` stays off and
+`wDefaultsCheckDomains` used to run from a 2 s timer that `stat()`ed three files
+(`src/defaults.c`: `WindowMaker`, `WMWindowAttributes`, `WMRootMenu`) and compared `st_mtime`
+(`WMState` and the global `/usr/X11/etc/WindowMaker/*` files were never polled, and still are not).
+
+**What it does now.** `wDefaultsStartWatching()` (`src/defaults.c`, called from `src/startup.c`
+where the poll was armed) registers `EVFILT_VNODE` knotes on the WUtil kqueue through
+`W_KQueueAddFilter` (DAR-431): one on the Defaults directory (`NOTE_WRITE|NOTE_DELETE|NOTE_RENAME|
+NOTE_LINK|NOTE_REVOKE`: entries created, removed or renamed, which is what the atomic
+temp-file + `rename()` of `WMWritePropListToFile`, `WINGs/proplist.c:1713`, does) and one on each
+of the three files (`NOTE_WRITE|NOTE_EXTEND|NOTE_ATTRIB|NOTE_LINK|NOTE_DELETE|NOTE_RENAME|NOTE_REVOKE`:
+in-place writes and touch). Descriptors are opened `O_EVTONLY` (`bsd/sys/fcntl.h:138`) with
+`O_CLOEXEC`, knotes are `EV_ADD|EV_CLEAR`. Events are debounced by 100 ms (a rename is preceded by
+the creation of the temp file, and an in-place writer produces several events). Then every watched
+path is `stat()`ed again and re-opened if its inode changed (a file knote is bound to its vnode
+and reports the delete or rename once), and the existing domain check runs. If the Defaults
+directory does not exist yet it is created (wmaker creates it on its first save anyway,
+`proplist.c:1652`).
+
+**Safety nets.** A 30 s poll (`DEFAULTS_SAFETY_INTERVAL`, `src/wconfig.h.in`; leeway 10 s) stays in
+case some filesystem delivers no vnode events. Under the select backend
+(`WM_EVENT_BACKEND=select`, or `kqueue()` failing) `W_KQueueAddFilter` returns NULL, nothing is
+watched and the old 2 s poll (with its DAR-432 leeway) runs as before; tested.
+
+**What the kernel guarantees.** The filter is VFS-generic: `vnode_filtops` (`bsd/vfs/vfs_vnops.c:148`,
+registered at `kern_event.c:345`) attaches to any vnode (`vfs_vnops.c:1865-1888`), and the events are
+posted by the VFS layer above the filesystem, in `kpi_vfs.c`: `NOTE_WRITE` after `VNOP_WRITE`
+(`:3721`), `NOTE_ATTRIB` after `VNOP_SETATTR` (`:3637`), `NOTE_DELETE|NOTE_LINK` after
+`VNOP_REMOVE` (`:4066`), `NOTE_RENAME` / `NOTE_DELETE` of the replaced target in `VNOP_RENAME`
+(`:4523-4526`), and `NOTE_WRITE` on the parent for every directory-entry change (`:3297`, `:4067`,
+`:4175`). So HFS+ and msdosfs need no support of their own; the filesystem is only asked for remove
+notifications for network filesystems (`vfs_vnops.c:1890`). Checked on this port's HFS+ root, below.
+
+**Vnode events fire on HFS+.** `wutil_vnode_test` (`tools/userland_staging/wutil_vnode_test.c` in
+xnu-iokit-pi3, run in the guest as root; it uses the same open/register calls as wmaker) on `/var/root`
+(the HFS+ root, `rd=disk0s2`) and on `/tmp` (also on that root volume; the image has no other
+filesystem mounted there), **QEMU**:
+
+| Case | File watch | Directory watch | Delay (incl. test's 2 ms poll and `sync`) |
+|---|---|---|---|
+| A in-place write (append) | `WRITE EXTEND` | none | 50-62 ms |
+| D touch (`utimes`) | `ATTRIB` | none | 0-2 ms |
+| B atomic replace (temp file + `rename`) | `DELETE` (old vnode unlinked) | `WRITE` | 57-67 ms |
+| E in-place write after re-opening the new file | `WRITE EXTEND` | none | 50-51 ms |
+| C delete + recreate | `DELETE LINK` | `WRITE` | 234-256 ms |
+
+All pass on both directories. A rename-replace reports `DELETE` on the file watch and not
+`RENAME` (the renamed vnode is the temp file, not the watched one), so a watch on the file alone
+would go stale after the first replace; the directory watch plus re-opening is what keeps it working.
+msdosfs was not tested (no msdosfs volume is mounted in the guest); by the code above it gets the same
+VFS-level events.
+
+**Reload on QEMU** (`tools/wm_vnode_verify_guest.sh reload`; Xvfb + wmaker; the domain files exist at
+start). With the root menu open, `MenuTitleBack` of `WindowMaker` is changed and a snapshot of the
+framebuffer is taken 1 s later (the change itself takes about 1.5 s in the guest, `mv` and `touch` are
+slow under TCG); the title colour of the open menu shows whether the change was applied:
+
+| Change | Before (2 s poll, 1 s leeway) | After (vnode watch) |
+|---|---|---|
+| A atomic rename-replace, red | new colour | new colour |
+| B in-place write, green | new colour | new colour |
+| C delete + recreate, blue | **old colour** (applied after the snapshot) | new colour |
+| D touch only | (reloaded later) | reloaded, no visible change |
+
+Three samples, so this is only an illustration of the poll's random 0-3 s delay; the trace
+(`WM_DEFAULTS_TRACE=1` prints a line for every vnode event and every reload, with millisecond
+time) shows the watch path: first event to reload takes about 100-200 ms in every case (debounce plus
+scheduling). Also tried and passing: starting with no Defaults files at all (the files are created
+after wmaker is running and are picked up), and `WM_EVENT_BACKEND=select` (reloads via the 2 s poll, no
+vnode events). Reload of `WMRootMenu` is confirmed by the trace (`reload WMRootMenu` after each change)
+but not on screen: the root menu that x11_probe's click opens stays open and does not close again in
+this harness, so a rebuilt menu was never shown. `OpenRootMenu` also only rebuilds the menu when the
+file's mtime is a newer second than the one on screen (`src/rootmenu.c:1620-1621`, unchanged).
+
+**Idle wake-ups and CPU**, **QEMU**, one Xvfb per boot, a discarded warm-up wmaker and two 60 s idle
+windows per boot (`tools/wm_vnode_verify_guest.sh idle`), same image recipe before and after;
+indicative only (TCG):
+
+| Measure | Before (DAR-432 state) | After |
+|---|---|---|
+| Blocking waits at idle | 4 per 11 s, about 0.35 per second (`wDefaultsCheckDomains` and `synchronizeUserDefaults` fire together every 3 s) | 1 per 30 s, about 0.03 per second (only the safety poll) |
+| Idle wmaker CPU over 60 s | 0.39, 0.40, 0.43 s | 0.03, 0.07, 0.07 s |
+
+The before numbers agree with DAR-432's (0.32-0.42 s). `synchronizeUserDefaults`
+(`WINGs/userdefaults.c:167`) was the second idle timer: wmaker's own domain is `dontSync`, so it never
+did anything; it is now only armed when a database that syncs exists (`WMEnableUDPeriodicSynchronization`
+arms it too), which is what Linux builds get with inotify.
+
+**Other changes.**
+
+* Change detection also compares inode and size, not only `st_mtime` (one second resolution): with a
+  check right after the first write, a second change in the same second was invisible. Seen in the
+  test: a truncate-then-write saw the empty file first (`could not load domain WMRootMenu`), and the
+  next event reloaded the complete one.
+* `wDefaultsCheckDomains` no longer re-arms the poll timer itself: every SIGHUP or `Reconfigure`
+  message used to add another poll chain. The poll is now a separate callback.
+* `wDefaultsInitDomain` read `stbuf.st_mtime` uninitialised when the user file did not exist, which
+  could set the domain's timestamp to stack garbage and make the change check ignore the file
+  once it appeared (seen: a `WindowMaker` file created after start never reloaded). `stbuf` is zeroed.
+
+**Known limits.** The global defaults (`/usr/X11/etc/WindowMaker`, `GLOBAL_DEFAULTS_SUBDIR`) were never
+polled (they are read only when the user file changes) and are not watched; `WMState` likewise. One
+open descriptor per watched path (four). Needs the kqueue backend (arm64 Darwin, through `kq64()`,
+see section 5); elsewhere the poll stays. The guest's wall clock is stepped by chronyd (DAR-169), so
+the test script stops it and sets file mtimes itself; real use is not affected by that, but as
+before a file with an mtime older than the last loaded one is only noticed if its inode or size
+differ. msdosfs and the real Pi are not measured.
 
 ### Not yet measured on real hardware
 
