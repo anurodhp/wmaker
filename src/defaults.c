@@ -58,6 +58,12 @@
 #include "xmodifier.h"
 #include "icon.h"
 #include "main.h"
+#ifdef WM_USE_KQUEUE
+# include <sys/event.h>
+# include <fcntl.h>
+# include <errno.h>
+# include <WINGs/WINGsP.h>
+#endif
 #include "actions.h"
 #include "dock.h"
 #include "workspace.h"
@@ -1048,7 +1054,32 @@ void wReadStaticDefaults(WMPropList * dict)
 	}
 }
 
-void wDefaultsCheckDomains(void* arg)
+/*
+ * Change detection (DAR-433). The poll compared only the file's st_mtime
+ * (one second resolution on HFS+) with the time of the last load, so a second
+ * change inside the same second was never seen. With vnode events a check
+ * runs right after the first write, which makes that window real, so the
+ * inode and the size are compared as well. `seen` holds what the last check
+ * saw; until a domain has been checked once only the mtime counts.
+ */
+static struct domainStat {
+	int valid;
+	ino_t ino;
+	off_t size;
+} seenMaker, seenAttr, seenMenu;
+
+static int domainChanged(const WDDomain *domain, const struct stat *st, struct domainStat *seen)
+{
+	int changed = domain->timestamp < st->st_mtime ||
+		      (seen->valid && (seen->ino != st->st_ino || seen->size != st->st_size));
+
+	seen->valid = 1;
+	seen->ino = st->st_ino;
+	seen->size = st->st_size;
+	return changed;
+}
+
+static void checkDomains(void)
 {
 	WScreen *scr;
 	struct stat stbuf;
@@ -1056,10 +1087,7 @@ void wDefaultsCheckDomains(void* arg)
 	WMPropList *dict;
 	int i;
 
-	/* Parameter not used, but tell the compiler that it is ok */
-	(void) arg;
-
-	if (stat(w_global.domain.wmaker->path, &stbuf) >= 0 && w_global.domain.wmaker->timestamp < stbuf.st_mtime) {
+	if (stat(w_global.domain.wmaker->path, &stbuf) >= 0 && domainChanged(w_global.domain.wmaker, &stbuf, &seenMaker)) {
 		w_global.domain.wmaker->timestamp = stbuf.st_mtime;
 
 		/* Global dictionary */
@@ -1102,7 +1130,7 @@ void wDefaultsCheckDomains(void* arg)
 
 	}
 
-	if (stat(w_global.domain.window_attr->path, &stbuf) >= 0 && w_global.domain.window_attr->timestamp < stbuf.st_mtime) {
+	if (stat(w_global.domain.window_attr->path, &stbuf) >= 0 && domainChanged(w_global.domain.window_attr, &stbuf, &seenAttr)) {
 		/* global dictionary */
 		shared_dict = readGlobalDomain("WMWindowAttributes", True);
 		/* user dictionary */
@@ -1146,7 +1174,7 @@ void wDefaultsCheckDomains(void* arg)
 			WMReleasePropList(shared_dict);
 	}
 
-	if (stat(w_global.domain.root_menu->path, &stbuf) >= 0 && w_global.domain.root_menu->timestamp < stbuf.st_mtime) {
+	if (stat(w_global.domain.root_menu->path, &stbuf) >= 0 && domainChanged(w_global.domain.root_menu, &stbuf, &seenMenu)) {
 		dict = WMReadPropListFromFile(w_global.domain.root_menu->path);
 		if (dict) {
 			if (!WMIsPLArray(dict) && !WMIsPLString(dict)) {
@@ -1166,11 +1194,206 @@ void wDefaultsCheckDomains(void* arg)
 		}
 		w_global.domain.root_menu->timestamp = stbuf.st_mtime;
 	}
-#ifndef HAVE_INOTIFY
-	if (!arg)
-		WMAddTimerHandlerWithLeeway(DEFAULTS_CHECK_INTERVAL, DEFAULTS_CHECK_LEEWAY, wDefaultsCheckDomains, arg);
-#endif
 }
+
+/*
+ * Re-read whatever changed. Callers: SIGHUP, the Reconfigure client message,
+ * the watcher and the poll below. (It used to re-arm the poll timer itself,
+ * so every reconfigure added another poll chain.)
+ */
+void wDefaultsCheckDomains(void *arg)
+{
+	/* Parameter not used, but tell the compiler that it is ok */
+	(void) arg;
+
+	checkDomains();
+}
+
+#ifndef HAVE_INOTIFY
+/*
+ * Defaults file watching (DAR-433). Darwin has no inotify; the kqueue
+ * equivalent is EVFILT_VNODE on the WUtil kqueue (W_KQueueAddFilter).
+ *
+ * What is watched: the Defaults directory (entries created, removed or
+ * renamed: atomic replace by WMWritePropListToFile's rename(), a file that
+ * did not exist yet) and the three polled domain files (in-place writes,
+ * touch). A file's knote is bound to its vnode, so after a delete or rename
+ * the old fd only reports that once; every event therefore re-checks each
+ * path and re-opens the ones whose inode changed.
+ *
+ * Events are debounced by WATCH_DEBOUNCE ms: the rename of an atomic write
+ * is preceded by the creation of the temp file, and an in-place writer
+ * produces several events; the check then runs once on the settled file.
+ *
+ * Without the kqueue backend (WM_EVENT_BACKEND=select, kqueue() failing, or
+ * the directory not openable) W_KQueueAddFilter returns NULL and the old
+ * DEFAULTS_CHECK_INTERVAL poll stays. With the watch in place the poll
+ * slows to DEFAULTS_SAFETY_INTERVAL, in case some filesystem delivers no
+ * vnode events.
+ */
+#ifdef WM_USE_KQUEUE
+# ifndef O_EVTONLY
+#  define O_EVTONLY O_RDONLY
+# endif
+# define WATCH_DEBOUNCE 100	/* ms */
+# define NWATCHES 4		/* the directory and the three domain files */
+
+typedef struct {
+	char *path;
+	int fd;			/* -1: not watched */
+	W_KQueueID id;
+	dev_t dev;
+	ino_t ino;
+	int isdir;
+} Watch;
+
+static Watch watches[NWATCHES];
+static int watchesInited;
+static WMHandlerID debounceTimer;
+#endif
+
+static WMHandlerID pollTimer;
+static int dirWatched;
+
+static void armPoll(void);
+
+#ifdef WM_USE_KQUEUE
+static void unwatch(Watch *w)
+{
+	if (w->fd < 0)
+		return;
+	/* delete the knote before closing: W_KQueueDeleteFilter addresses it by fd */
+	W_KQueueDeleteFilter(w->id);
+	close(w->fd);
+	w->fd = -1;
+	w->id = NULL;
+}
+
+static void vnodeEvent(const struct kevent *ev, void *clientData);
+
+/* Returns 1 if w is now watched (was already, on the same vnode, or has just been opened). */
+static int watchOne(Watch *w)
+{
+	struct stat st;
+	struct kevent kev;
+	int fd;
+
+	if (w->fd >= 0) {
+		if (stat(w->path, &st) == 0 && st.st_ino == w->ino && st.st_dev == w->dev)
+			return 1;
+		unwatch(w);	/* deleted, renamed away or replaced */
+	}
+
+	fd = open(w->path, O_EVTONLY | O_CLOEXEC);
+	if (fd < 0)
+		return 0;	/* e.g. WMRootMenu does not exist (yet): the directory watch reports its creation */
+	if (fstat(fd, &st) < 0) {
+		close(fd);
+		return 0;
+	}
+
+	EV_SET(&kev, fd, EVFILT_VNODE, EV_ADD | EV_CLEAR,
+	       NOTE_WRITE | NOTE_EXTEND | NOTE_ATTRIB | NOTE_LINK | NOTE_DELETE | NOTE_RENAME | NOTE_REVOKE,
+	       0, NULL);
+	w->id = W_KQueueAddFilter(&kev, vnodeEvent, w);
+	if (!w->id) {
+		close(fd);
+		return 0;
+	}
+	w->fd = fd;
+	w->dev = st.st_dev;
+	w->ino = st.st_ino;
+	return 1;
+}
+
+static void rewatchAll(void)
+{
+	int i;
+
+	for (i = 0; i < NWATCHES; i++)
+		if (watches[i].path) {
+			int ok = watchOne(&watches[i]);
+
+			if (watches[i].isdir)
+				dirWatched = ok;
+		}
+}
+
+static void debounceFired(void *clientData)
+{
+	(void) clientData;
+
+	debounceTimer = NULL;
+	rewatchAll();		/* first: a change between the stat below and a later open would be lost */
+	checkDomains();
+}
+
+static void vnodeEvent(const struct kevent *ev, void *clientData)
+{
+	(void) ev;
+	(void) clientData;
+
+	if (!debounceTimer)
+		debounceTimer = WMAddTimerHandlerWithLeeway(WATCH_DEBOUNCE, WATCH_DEBOUNCE / 2, debounceFired, NULL);
+}
+
+static void setupWatches(void)
+{
+	WDDomain *doms[NWATCHES - 1];
+	int i;
+
+	if (watchesInited)
+		return;
+	watchesInited = 1;
+
+	doms[0] = w_global.domain.wmaker;
+	doms[1] = w_global.domain.window_attr;
+	doms[2] = w_global.domain.root_menu;
+	for (i = 0; i < NWATCHES; i++) {
+		watches[i].fd = -1;
+		watches[i].isdir = (i == 0);
+		watches[i].path = (i == 0) ? wdefaultspathfordomain("") : wstrdup(doms[i - 1]->path);
+	}
+	/* Nothing to watch before the first save otherwise; WMWritePropListToFile creates it too (proplist.c:1652) */
+	wmkdirhier(watches[0].path);
+	rewatchAll();
+}
+#endif /* WM_USE_KQUEUE */
+
+static void pollTimerFired(void *clientData)
+{
+	(void) clientData;
+
+	pollTimer = NULL;
+#ifdef WM_USE_KQUEUE
+	if (watchesInited)
+		rewatchAll();
+#endif
+	checkDomains();
+	armPoll();
+}
+
+static void armPoll(void)
+{
+	if (pollTimer)
+		WMDeleteTimerHandler(pollTimer);
+	if (dirWatched)
+		pollTimer = WMAddTimerHandlerWithLeeway(DEFAULTS_SAFETY_INTERVAL, DEFAULTS_SAFETY_LEEWAY,
+							pollTimerFired, NULL);
+	else
+		pollTimer = WMAddTimerHandlerWithLeeway(DEFAULTS_CHECK_INTERVAL, DEFAULTS_CHECK_LEEWAY,
+							pollTimerFired, NULL);
+}
+
+void wDefaultsStartWatching(void)
+{
+#ifdef WM_USE_KQUEUE
+	setupWatches();
+	checkDomains();		/* anything that changed since the domains were read */
+#endif
+	armPoll();
+}
+#endif /* !HAVE_INOTIFY */
 
 void wReadDefaults(WScreen * scr, WMPropList * new_dict)
 {

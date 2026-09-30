@@ -175,6 +175,10 @@ static void addSynchronizeTimerHandler(void)
 void WMEnableUDPeriodicSynchronization(WMUserDefaults * database, Bool enable)
 {
 	database->dontSync = !enable;
+#ifndef HAVE_INOTIFY
+	if (enable)
+		addSynchronizeTimerHandler();
+#endif
 }
 
 void WMSynchronizeUserDefaults(WMUserDefaults * database)
@@ -345,7 +349,9 @@ WMUserDefaults *WMGetStandardUserDefaults(void)
 	sharedUserDefaults = defaults;
 
 #ifndef HAVE_INOTIFY
-	addSynchronizeTimerHandler();
+	/* the periodic sync skips a dontSync database: do not wake up for nothing (DAR-433) */
+	if (!defaults->dontSync)
+		addSynchronizeTimerHandler();
 #endif
 	registerSaveOnExit();
 
@@ -418,7 +424,9 @@ WMUserDefaults *WMGetDefaultsFromPath(const char *path)
 	sharedUserDefaults = defaults;
 
 #ifndef HAVE_INOTIFY
-	addSynchronizeTimerHandler();
+	/* the periodic sync skips a dontSync database: do not wake up for nothing (DAR-433) */
+	if (!defaults->dontSync)
+		addSynchronizeTimerHandler();
 #endif
 	registerSaveOnExit();
 

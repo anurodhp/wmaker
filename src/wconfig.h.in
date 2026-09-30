@@ -327,6 +327,9 @@
 #define DEFAULTS_CHECK_INTERVAL	2000
 /* ms the poll may run late so that its wake-up coalesces with other idle timers (DAR-432) */
 #define DEFAULTS_CHECK_LEEWAY	1000
+/* With EVFILT_VNODE watches on the defaults files (DAR-433) the poll is only a safety net */
+#define DEFAULTS_SAFETY_INTERVAL	30000
+#define DEFAULTS_SAFETY_LEEWAY		10000
 #endif
 
 #define KEY_CONTROL_WINDOW_WEIGHT 1

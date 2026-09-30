@@ -711,7 +711,7 @@ void StartUp(Bool defaultScreenOnly)
 #ifndef HAVE_INOTIFY
 	/* setup defaults file polling */
 	if (!wPreferences.flags.noupdates)
-		WMAddTimerHandler(3000, wDefaultsCheckDomains, NULL);
+		wDefaultsStartWatching();
 #endif
 
 }
