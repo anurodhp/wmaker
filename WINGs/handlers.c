@@ -499,6 +499,7 @@ static char kq_fd_tag;		/* udata of every fd-input registration */
 # define KQ_IS_TIMER_TAG(p)	0
 #else
 # define KQ_IS_TIMER_TAG(p)	((void *)(p) == (void *)&kq_timer_tag)
+#define KQ_TIMER_IDENT 0x574d5431u	/* 'WMT1': distinct from idents W_KQueueAddFilter users choose */
 static char kq_timer_tag;	/* udata of the timer-queue EVFILT_TIMER */
 static int kq_timer_ok = 1;	/* 0: unsupported here, use the kevent() timeout */
 static int kq_timer_errno;	/* errno of the registration that disabled it */
@@ -723,7 +724,7 @@ static int kq_timer_arm(void)
 		return 1;
 
 	memset(&ev, 0, sizeof ev);
-	ev.ident = 1;
+	ev.ident = KQ_TIMER_IDENT;
 	ev.filter = EVFILT_TIMER;
 	ev.flags = EV_ADD | EV_ENABLE;
 	ev.fflags = NOTE_MACHTIME | NOTE_ABSOLUTE | NOTE_LEEWAY;
@@ -747,7 +748,7 @@ static int kq_timer_arm(void)
 static void kq_timer_disarm(void)
 {
 	if (kq_timer_armed) {
-		kq_change(1, EVFILT_TIMER, EV_DELETE, 0, NULL);
+		kq_change(KQ_TIMER_IDENT, EVFILT_TIMER, EV_DELETE, 0, NULL);
 		kq_timer_armed = 0;
 	}
 }

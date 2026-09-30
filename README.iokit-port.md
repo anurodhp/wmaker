@@ -206,18 +206,19 @@ advancing. The same test passes under `WM_EVENT_BACKEND=select`, and `wutil_kq_t
 cases, including the `W_KQueueAddFilter` one, now on `kevent64`) still passes on both backends.
 
 **Idle wake-ups and CPU**, **QEMU**, one Xvfb per boot, a discarded warm-up wmaker, then two 60 s
-idle windows (`tools/wm_timer_verify_guest.sh idle`), two boots each; indicative only (TCG):
+idle windows (`tools/wm_timer_verify_guest.sh idle`), two boots before and three after; indicative
+only (TCG):
 
 | Measure | Before (DAR-431 loop, wall-clock timers) | After |
 |---|---|---|
 | Blocking waits at idle | about 1.0 per second (10 per 10 s) | about 0.35 per second (4 per 11.5 s) |
-| Idle wmaker CPU over 60 s | 0.87, 0.94, 0.83, 0.96 s | 0.37, 0.42, 0.32, 0.36 s |
-| Round-trip latency, median | 12.2, 12.9 ms | 10.3, 11.2 ms |
+| Idle wmaker CPU over 60 s | 0.87, 0.94, 0.83, 0.96 s | 0.37, 0.42, 0.32, 0.36, 0.36, 0.33 s |
+| Round-trip latency, median | 12.2, 12.9 ms | 10.3, 11.2, 12.2, 10.6 ms |
 
 The latency difference is noise; there is no sign of a cost from the wider timer window. The
 warm-up wmaker of each boot is not comparable (it is still starting). The kernel-side effect of
 leeway in the isolated test is visible but noisy: in `wutil_timer_test` case 5 (timer A 300 ms with
-400 ms leeway, timer B 600 ms) A fired together with B at about 600 ms in one of four runs and at
+400 ms leeway, timer B 600 ms) A fired together with B at about 600-650 ms (one wake-up) in two of five runs and at
 about 400 ms (another wake-up at that time) in the others, so in practice coalescing depends on
 what else wakes the CPU; the idle numbers above are the measurement that counts.
 
