@@ -922,8 +922,8 @@ static const char *stat_backend = "select";
 
 static void printStats(void)
 {
-	fprintf(stderr, "WUtil event stats: backend=%s blocking_waits=%lu with_input=%lu\n",
-		stat_backend, stat_waits, stat_woke);
+	fprintf(stderr, "WUtil event stats: t=%ld backend=%s blocking_waits=%lu with_input=%lu\n",
+		(long)time(NULL), stat_backend, stat_waits, stat_woke);
 }
 
 static void periodicStats(void)
