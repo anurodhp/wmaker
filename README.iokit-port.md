@@ -347,7 +347,7 @@ setup (`PDGOPSetup`, which runs on the main thread before probing), which logs
 `puredarwingop: main thread QoS set: rc=0, class now 0x21` to Xorg.0.log. Apps are not touched.
 
 **What the kernel does** (xnu-7195). The ticket expected base priority 46 (`thread_policy.c:74`,
-`sched.h:160`). That is the table value, but the session job is a DAEMON_INTERACTIVE task, and for
+`sched.h:161`). That is the table value, but the session job is a DAEMON_INTERACTIVE task, and for
 daemons `task_policy.c:866-868` caps the task's QoS at USER_INITIATED, applied to every thread at
 `thread_policy.c:1554-1556`. So the thread goes from 31 (LEGACY, the daemon primordial QoS,
 `task_policy.c:2069-2074`) to 37 (`sched.h:162`). Measured with `thread_info` in the guest:
