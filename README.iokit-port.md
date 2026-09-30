@@ -22,7 +22,7 @@ boots); numbers for the real Pi are noted as pending where they have not been ta
 | Build the whole X11 stack, wrlib, WINGs and wmaker at `-O2` | xnu-iokit-pi3: `x11_common.sh` (`X11_OPT`, default `-O2`) (DAR-438) | Done on QEMU, merged | About 1.3x to 1.8x on wrlib and Xlib micro-benchmarks (table below). |
 | wrlib 32bpp TrueColor fast path and NEON blending | this fork, commit `1ef1522c` (DAR-437) | Done on QEMU, merged | `RConvertImage + XCopyArea` about 80 ms to about 58 ms per op; `RCombineImages` (RGB over RGB) about 12 ms to about 4 ms per op. |
 | kqueue-backed event loop instead of `select()` | this fork (DAR-431) | Done on QEMU, merged | No speed change by itself (see below); it gives one wait that the timer and file-watch tickets build on. |
-| Monotonic, coalesced timers (`NOTE_MACHTIME` + `NOTE_LEEWAY`) | this fork (DAR-432) | Planned, after DAR-431 | |
+| Monotonic, coalesced timers (`NOTE_MACHTIME` + `NOTE_LEEWAY`) | this fork (DAR-432) | Done on QEMU | Timers survive `settimeofday()` steps. Idle wake-ups about 1.0 per second to about 0.35 per second; idle CPU about 0.9 s to about 0.35 s per 60 s (see below). |
 | `EVFILT_VNODE` watch of `~/GNUstep/Defaults` instead of 2 s `stat()` polling | this fork (DAR-433) | Planned, after DAR-431 | |
 
 ### 1. Session priority (biggest user-visible win)
@@ -133,6 +133,98 @@ about 25 times slower (median 275 ms) on either backend.
 
 One known limit: an fd that is closed without being deleted from the handler list never fires
 under kqueue (under `select()` it spins).
+
+### 5. Monotonic, coalesced timers (this fork)
+
+Commits `def4898a` and `8a5e481e` (`WINGs/handlers.c`). Two changes.
+
+**Clock.** WUtil timer deadlines were `gettimeofday()` timevals. chronyd steps the clock with
+`settimeofday()` on this port (DAR-169), so a step back left every pending timer waiting for the
+step size and a step forward fired them all at once. Deadlines are now timevals on
+`mach_absolute_time()` (`CLOCK_MONOTONIC` on other systems). That is the clock the kernel's own
+`kevent()` timeout runs on (`kern_event.c:7932-7957`, `kevent_legacy_get_deadline` converts through
+`clock_absolutetime_interval_to_deadline`) and the epoch of `NOTE_MACHTIME|NOTE_ABSOLUTE` deadlines
+(`bsd/sys/event.h:568-576`). The queue semantics (`WMAddTimerHandler`,
+`WMAddPersistentTimerHandler`, `WMDeleteTimerHandler`) are unchanged, and the select fallback keeps
+the same queue with precise deadlines.
+
+**Coalescing.** New `WMAddTimerHandlerWithLeeway` and `WMAddPersistentTimerHandlerWithLeeway`; the
+old calls use a default leeway of 10% of the interval, at most 50 ms. Under the kqueue backend the
+whole queue is one `EVFILT_TIMER` knote, armed for the next wake-up window: deadline = earliest
+deadline, leeway = (earliest `deadline + leeway` over all pending timers) minus that deadline, so no
+timer is held past its own leeway. `kevent()` then blocks with no timeout; on each wake-up every
+timer whose deadline has passed fires, so timers that fall in one window share one wake-up. What the
+kernel does with it:
+
+* `NOTE_MACHTIME|NOTE_ABSOLUTE`: `data` is an absolute deadline in `mach_absolute_time` units
+  (`filt_timervalidate`, `kern_event.c:1337, 1372`). Absolute timers are forced one-shot
+  (`filt_timerattach`, `kern_event.c:1629-1631`), so the knote is re-armed after each delivery; a
+  deadline in the past fires at once (`filt_timer_is_ready`). Changing it is a touch of the same
+  knote (`filt_timertouch`, `kern_event.c:1668-1695`).
+* `NOTE_LEEWAY`: `ext[1]` is the leeway in the same units (`kern_event.c:1348-1363`).
+  `filt_timerarm` passes it to `thread_call_enter_delayed_with_leeway` (`kern_event.c:1574`), which
+  uses `max(leeway, default slop for the thread's QoS tier)` as the slop and sets the hard deadline
+  to deadline + slop (`thread_call.c:1236-1246`); the timer call is armed with that leeway
+  (`thread_call.c:799-804`), so the CPU pops at the hard deadline unless something else wakes it
+  first and then everything whose deadline has passed fires.
+* The plain `kevent()` timeout cannot be used for this: `kqueue_scan` waits with
+  `TIMEOUT_NO_LEEWAY` (`kern_event.c:7510-7512`). It stays as the path if the knote cannot be
+  registered.
+* `ext[1]` exists only in `struct kevent64_s` / `kevent_qos_s`; legacy `kevent()` zero-fills it.
+  This port's `libsystem_kernel` exports neither `kevent64` nor `kevent_qos`, so `kq64()` issues the
+  syscall directly (`syscalls.master:560`, number 369; arm64 Darwin: number in `x16`, `svc #0x80`,
+  carry set = error with errno in `x0`, `bsd/dev/arm/systemcalls.c:305-307`). A kqueue is "legacy32" or not from its first use, and
+  xnu refuses the other interface on it with `EINVAL` (`kern_event.c:6873-6877`), which the first
+  version of this change ran into (the timer never armed); the whole WUtil kqueue (waits,
+  registrations, timer) now goes through `kq64()`, and the kqueue backend is compiled for arm64
+  Darwin only. The clean fix would be exporting `kevent64` from `libsystem_kernel`; not done here.
+
+Which timers are alive on an idle Window Maker (`WM_EVENT_STATS` now also counts callback fires):
+exactly two, each about every 2 s: `wDefaultsCheckDomains` (`src/defaults.c:1171`, the defaults
+poll that DAR-433 will remove) and `synchronizeUserDefaults` (`WINGs/userdefaults.c:167`). They
+ran out of phase, so every second had a wake-up. Both now get 1000 ms of leeway
+(`DEFAULTS_CHECK_LEEWAY`, `UD_SYNC_LEEWAY`): a 2 s poll that runs up to 1 s late is harmless, and
+their windows overlap, so after the first shared wake-up they stay together (each re-arms from the
+moment it fired). Side effect: the pair now runs every 3 s instead of every 2 s (the kernel fires
+at the hard deadline, then the timers re-arm), which only makes the defaults-change poll slower.
+Everything else (balloon, clip auto-raise, menu and scroll timers) keeps the default leeway of at
+most 50 ms.
+
+**Clock-step test** (`tools/userland_staging/wutil_timer_test.c` in xnu-iokit-pi3, run as root in
+the guest, durations measured on `mach_absolute_time`). A 600 ms timer is armed, the wall clock is
+stepped after 150 ms, the clock is restored afterwards:
+
+| Case | Before (wall-clock queue) | After |
+|---|---|---|
+| step back 60 s, 600 ms timer | not fired within 3000 ms (would wait about 60 s) | fires at 624-703 ms |
+| step forward 60 s, 600 ms timer | fires at 196-263 ms (early) | fires at 640-704 ms |
+| persistent 100 ms timer, 1 s window, step back 60 s in the middle | 3-4 fires (5-6 without a step) | 5 fires (5 without a step) |
+
+Under a running wmaker (`WM_EVENT_STATS=10`), a `-3600 s` step stopped the stats output for about
+60 s before (the wait was blocked on the old deadline), and after it the wait counter kept
+advancing. The same test passes under `WM_EVENT_BACKEND=select`, and `wutil_kq_test` (the DAR-431
+cases, including the `W_KQueueAddFilter` one, now on `kevent64`) still passes on both backends.
+
+**Idle wake-ups and CPU**, **QEMU**, one Xvfb per boot, a discarded warm-up wmaker, then two 60 s
+idle windows (`tools/wm_timer_verify_guest.sh idle`), two boots each; indicative only (TCG):
+
+| Measure | Before (DAR-431 loop, wall-clock timers) | After |
+|---|---|---|
+| Blocking waits at idle | about 1.0 per second (10 per 10 s) | about 0.35 per second (4 per 11.5 s) |
+| Idle wmaker CPU over 60 s | 0.87, 0.94, 0.83, 0.96 s | 0.37, 0.42, 0.32, 0.36 s |
+| Round-trip latency, median | 12.2, 12.9 ms | 10.3, 11.2 ms |
+
+The latency difference is noise; there is no sign of a cost from the wider timer window. The
+warm-up wmaker of each boot is not comparable (it is still starting). The kernel-side effect of
+leeway in the isolated test is visible but noisy: in `wutil_timer_test` case 5 (timer A 300 ms with
+400 ms leeway, timer B 600 ms) A fired together with B at about 600 ms in one of four runs and at
+about 400 ms (another wake-up at that time) in the others, so in practice coalescing depends on
+what else wakes the CPU; the idle numbers above are the measurement that counts.
+
+Caveats: the leeway knob is only as good as the kernel's coalescing (per-CPU timer queue; other
+timers may wake the CPU earlier, which fires our timers early but never before their deadline).
+The select fallback ignores leeway. The numbers are QEMU only; the real Pi is still to be
+measured.
 
 ### Not yet measured on real hardware
 

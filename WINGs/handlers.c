@@ -83,7 +83,7 @@ static WMArray *inputHandler = NULL;
  * and a wall-clock deadline then fires early (forward step) or waits for
  * the step size (backward step). The Darwin clock is mach_absolute_time():
  * it is the clock the kernel's own kevent()/select() timeouts run on
- * (kern_event.c kevent_get_timeout -> clock_absolutetime_interval_to_deadline)
+ * (kern_event.c:7932-7957, kevent_legacy_get_deadline -> clock_absolutetime_interval_to_deadline)
  * and the epoch of EVFILT_TIMER's NOTE_MACHTIME|NOTE_ABSOLUTE deadlines
  * (sys/event.h:575). Elsewhere CLOCK_MONOTONIC, and gettimeofday() only when
  * neither exists. The value is never {0,0}: IS_ZERO() marks a timer that is
@@ -433,7 +433,7 @@ void WMDeleteIdleHandler(WMHandlerID handlerID)
  * This port's libsystem_kernel exports neither kevent64 nor kevent_qos,
  * so the syscall (bsd/kern/syscalls.master:560, number SYS_kevent64) is
  * made directly: arm64 Darwin takes the number in x16 with `svc #0x80`;
- * carry set means failure, errno in x0 (bsd/dev/arm/systemcalls.c); on
+ * carry set means failure, errno in x0 (bsd/dev/arm/systemcalls.c:305-307); on
  * success x0 is the number of events returned.
  * Returns that number, or -1 with errno set.
  */
@@ -673,15 +673,14 @@ void W_KQueueDeleteFilter(W_KQueueID id)
  * queue's next wake-up window (nextTimerWindow) and kevent() then blocks
  * with no timeout. Why, and what it needs:
  *  - NOTE_MACHTIME|NOTE_ABSOLUTE: `data` is a deadline in mach_absolute_time
- *    units (sys/event.h:568-576; filt_timervalidate, kern_event.c:1312-1313,
- *    1368-1369), the clock rightNow() uses. NOTE_ABSOLUTE makes it a one-shot
- *    (filt_timerattach, kern_event.c:1631-1633), so it is re-armed after each
+ *    units (sys/event.h:568-576; filt_timervalidate, kern_event.c:1337, 1372), the clock rightNow() uses. NOTE_ABSOLUTE makes it a one-shot
+ *    (filt_timerattach, kern_event.c:1629-1631), so it is re-armed after each
  *    delivery. A deadline in the past fires at once (filt_timer_is_ready).
  *  - NOTE_LEEWAY: ext[1] is the leeway in the same units (kern_event.c:
- *    1348-1363). filt_timerarm passes it to thread_call_enter_delayed_with_
+ *    1353-1363). filt_timerarm passes it to thread_call_enter_delayed_with_
  *    leeway (kern_event.c:1574), which uses max(leeway, the default slop of
  *    the thread's QoS tier) as the coalescing slop and sets the hard
- *    deadline to deadline + slop (thread_call.c:1223-1232). The kernel then
+ *    deadline to deadline + slop (thread_call.c:1236-1246). The kernel then
  *    wakes us at the hard deadline unless some other timer wakes the CPU
  *    first; that is what lets idle wake-ups coalesce. Leeway here is
  *    (earliest hard deadline - earliest soft deadline), so no timer is
@@ -690,7 +689,7 @@ void W_KQueueDeleteFilter(W_KQueueID id)
  *    TIMEOUT_NO_LEEWAY (kern_event.c:7510-7512). That timeout stays as the
  *    fallback if the knote cannot be registered.
  * Changing the registered deadline/leeway is a touch of the same knote
- * (filt_timertouch, kern_event.c:1665-1698), so re-arming needs no delete.
+ * (filt_timertouch, kern_event.c:1668-1695), so re-arming needs no delete.
  *
  * The leeway field is ext[1], which only kevent64() can pass here (see
  * kq64() above).
