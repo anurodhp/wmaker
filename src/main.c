@@ -60,6 +60,10 @@
 
 #include <WINGs/WUtil.h>
 
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
+
 /****** Global Variables ******/
 struct wmaker_global_variables w_global;
 
@@ -556,6 +560,24 @@ int main(int argc, char **argv)
 {
 	int i_am_the_monitor, i, len;
 	char *str, *alt;
+
+#ifdef __APPLE__
+	/* DAR-439: run the window manager's main thread at USER_INTERACTIVE, as
+	 * the X server's main thread does (the PDGOP Xorg driver calls the same
+	 * function). Under the launchd session job (ProcessType=Interactive, a
+	 * DAEMON_INTERACTIVE task) XNU squashes USER_INTERACTIVE to
+	 * USER_INITIATED (osfmk/kern/task_policy.c:866-868, applied at
+	 * osfmk/kern/thread_policy.c:1554-1556), so the thread goes from base
+	 * priority 31 (THREAD_QOS_LEGACY, the daemon primordial QoS,
+	 * task_policy.c:2069-2074) to 37 (BASEPRI_USER_INITIATED,
+	 * osfmk/kern/sched.h:162), not 46. The kernel side is
+	 * bsd/pthread/pthread_workqueue.c bsdthread_set_self(). It has to be
+	 * called from inside the process: exec resets the main thread's QoS
+	 * (bsd/kern/kern_exec.c:4033 task_set_main_thread_qos). The return value
+	 * is ignored (EPERM only for a thread that opted out of QoS): the
+	 * priority just stays as it was. */
+	(void)pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
 
 	memset(&w_global, 0, sizeof(w_global));
 	w_global.program.state = WSTATE_NORMAL;
