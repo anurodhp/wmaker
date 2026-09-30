@@ -171,13 +171,13 @@ kernel does with it:
   `TIMEOUT_NO_LEEWAY` (`kern_event.c:7510-7512`). It stays as the path if the knote cannot be
   registered.
 * `ext[1]` exists only in `struct kevent64_s` / `kevent_qos_s`; legacy `kevent()` zero-fills it.
-  This port's `libsystem_kernel` exports neither `kevent64` nor `kevent_qos`, so `kq64()` issues the
-  syscall directly (`syscalls.master:560`, number 369; arm64 Darwin: number in `x16`, `svc #0x80`,
-  carry set = error with errno in `x0`, `bsd/dev/arm/systemcalls.c:305-307`). A kqueue is "legacy32" or not from its first use, and
+  `kq64()` calls the real `kevent64()` (`syscalls.master:560`, number 369), which `libsystem_kernel`
+  exports since DAR-456 (before that `kq64()` issued the syscall by hand: number in `x16`, `svc #0x80`;
+  that raw syscall is gone). A kqueue is "legacy32" or not from its first use, and
   xnu refuses the other interface on it with `EINVAL` (`kern_event.c:6873-6877`), which the first
   version of this change ran into (the timer never armed); the whole WUtil kqueue (waits,
-  registrations, timer) now goes through `kq64()`, and the kqueue backend is compiled for arm64
-  Darwin only. The clean fix would be exporting `kevent64` from `libsystem_kernel`; not done here.
+  registrations, timer) goes through `kq64()`, and the kqueue backend is compiled for arm64
+  Darwin only. `libWUtil` therefore needs the DAR-456 `libsystem_kernel` on the target.
 
 Which timers are alive on an idle Window Maker (`WM_EVENT_STATS` now also counts callback fires):
 exactly two, each about every 2 s: `wDefaultsCheckDomains` (`src/defaults.c:1171`, the defaults

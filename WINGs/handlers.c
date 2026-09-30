@@ -24,7 +24,8 @@
 
 /*
  * The kqueue backend talks to the kernel through kevent64() (see kq64()
- * below), which needs the arm64 Darwin syscall ABI; anywhere else
+ * below); it is compiled for arm64 Darwin only (the ports this was
+ * tested on); anywhere else
  * WM_USE_KQUEUE is ignored and the select() path is used.
  */
 #if defined(WM_USE_KQUEUE) && !(defined(__APPLE__) && defined(__arm64__))
@@ -33,7 +34,6 @@
 
 #ifdef WM_USE_KQUEUE
 # include <sys/event.h>
-# include <sys/syscall.h>
 # include <fcntl.h>
 # include <errno.h>
 # include <string.h>
@@ -422,43 +422,21 @@ void WMDeleteIdleHandler(WMHandlerID handlerID)
 #define KQ_MAXEVENTS 32
 
 /*
- * kevent64() as a raw syscall. All of this file's kqueue traffic uses it,
- * for two reasons:
+ * kevent64(). All of this file's kqueue traffic uses it, for two reasons:
  *  - EVFILT_TIMER's leeway travels in ext[1] (DAR-432), which legacy
  *    kevent() cannot carry (it zero-fills the extension fields);
  *  - a kqueue is either "legacy32" (kevent()) or not (kevent64()/
  *    kevent_qos()) from its first use on, and the other flavour is refused
  *    with EINVAL (bsd/kern/kern_event.c:6873-6877, kevent_get_kqfile), so
  *    the wait, the registrations and the timer must all use one of them.
- * This port's libsystem_kernel exports neither kevent64 nor kevent_qos,
- * so the syscall (bsd/kern/syscalls.master:560, number SYS_kevent64) is
- * made directly: arm64 Darwin takes the number in x16 with `svc #0x80`;
- * carry set means failure, errno in x0 (bsd/dev/arm/systemcalls.c:305-307); on
- * success x0 is the number of events returned.
- * Returns that number, or -1 with errno set.
+ * kevent64 (bsd/kern/syscalls.master:560) is a plain generated stub in
+ * libsystem_kernel (DAR-456; before that this called the syscall directly).
+ * Returns the number of events, or -1 with errno set.
  */
 static int kq64(int kq, const struct kevent64_s *change, int nchanges,
 		struct kevent64_s *events, int nevents, const struct timespec *timeout)
 {
-	register long x0 __asm__("x0") = kq;
-	register long x1 __asm__("x1") = (long)change;
-	register long x2 __asm__("x2") = nchanges;
-	register long x3 __asm__("x3") = (long)events;
-	register long x4 __asm__("x4") = nevents;
-	register long x5 __asm__("x5") = 0;
-	register long x6 __asm__("x6") = (long)timeout;
-	register long x16 __asm__("x16") = SYS_kevent64;
-	unsigned long failed;
-
-	__asm__ volatile ("svc #0x80\n\tcset %0, cs"
-			  : "=r" (failed), "+r" (x0), "+r" (x1)
-			  : "r" (x2), "r" (x3), "r" (x4), "r" (x5), "r" (x6), "r" (x16)
-			  : "memory", "cc");
-	if (failed) {
-		errno = (int)x0;
-		return -1;
-	}
-	return (int)x0;
+	return kevent64(kq, change, nchanges, events, nevents, 0, timeout);
 }
 
 static void kevTo64(const struct kevent *k, struct kevent64_s *k64, void *udata)
