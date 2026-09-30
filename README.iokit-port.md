@@ -21,7 +21,7 @@ boots); numbers for the real Pi are noted as pending where they have not been ta
 | `ProcessType=Interactive` for the X session job | xnu-iokit-pi3: `x11_config/session/org.puredarwin.x11-session.plist` (DAR-439 step 1) | Done, confirmed on the Pi | The UI became much faster (user-observed on the real Pi; not benchmarked). See below. |
 | Build the whole X11 stack, wrlib, WINGs and wmaker at `-O2` | xnu-iokit-pi3: `x11_common.sh` (`X11_OPT`, default `-O2`) (DAR-438) | Done on QEMU, merged | About 1.3x to 1.8x on wrlib and Xlib micro-benchmarks (table below). |
 | wrlib 32bpp TrueColor fast path and NEON blending | this fork, commit `1ef1522c` (DAR-437) | Done on QEMU, merged | `RConvertImage + XCopyArea` about 80 ms to about 58 ms per op; `RCombineImages` (RGB over RGB) about 12 ms to about 4 ms per op. |
-| kqueue-backed event loop instead of `select()` | this fork (DAR-431) | In progress | |
+| kqueue-backed event loop instead of `select()` | this fork (DAR-431) | Done on QEMU, merged | No speed change by itself (see below); it gives one wait that the timer and file-watch tickets build on. |
 | Monotonic, coalesced timers (`NOTE_MACHTIME` + `NOTE_LEEWAY`) | this fork (DAR-432) | Planned, after DAR-431 | |
 | `EVFILT_VNODE` watch of `~/GNUstep/Defaults` instead of 2 s `stat()` polling | this fork (DAR-433) | Planned, after DAR-431 | |
 
@@ -98,6 +98,41 @@ Open issue: in the full-NEON build `RScaleImage` went from about 27 to 46-57 ms/
 their instruction counts are identical. A memory-layout effect in QEMU is suspected but not
 proven. This needs a measurement on the real Pi; if it reproduces there, build the affected
 paths with `-DWR_NO_NEON`.
+
+### 4. kqueue event loop (this fork)
+
+Commits `e2baf4a5` and `347926fc`. `WINGs/handlers.c` (`W_HandleInputEvents`) now blocks in one
+lazily created kqueue, registered level-triggered (no `EV_CLEAR`). The X connection is
+registered on first use; read, write and except masks map to `EVFILT_READ`, `EVFILT_WRITE` and
+`EVFILT_EXCEPT` (`NOTE_OOB`); the timeout still comes from the same timer queue. `select()` stays
+as a runtime fallback: it is used if `kqueue()` fails, if a registration fails for any reason
+other than `EBADF`, or when the environment has `WM_EVENT_BACKEND=select`. A `pthread_atfork`
+child hook recreates the kqueue after `fork()` (xnu closes kqueue fds on fork,
+`kern_event.c:3025`). `WM_EVENT_STATS=N` prints wait counters every N seconds. Extra filters are
+added through `W_KQueueAddFilter`, which is what the timer (DAR-432) and file-watch (DAR-433)
+changes will use.
+
+Window Maker registers no WINGs input handlers of its own, so the only file descriptor it waits
+on is the X connection. `kevent()` is not restarted after a signal, even with `SA_RESTART`
+(`kern_event.c:7251`), which matches `select()`, so the SIGCHLD and SIGUSR handlers still
+interrupt the wait.
+
+**QEMU**, same image and same Xvfb, four warmed runs (select, kqueue, select, kqueue); the two
+backends are indistinguishable:
+
+| Measure | select | kqueue |
+|---|---|---|
+| Idle wmaker CPU time over 60 s | 0.92 s, 0.85 s | 0.94 s, 0.87 s |
+| Idle blocking waits | about 1 per second | about 1 per second |
+| Round-trip latency, median | 10.6 to 11.7 ms | 10.6 to 11.1 ms |
+| 200-event XTest burst | 3.8 to 6.2 ms per event | 3.7 to 5.9 ms per event |
+
+Idle CPU is timer-driven (every idle wait is a timeout; none is an input wakeup), and nothing
+spins. Also observed, not investigated: the first wmaker started after a fresh Xvfb answers
+about 25 times slower (median 275 ms) on either backend.
+
+One known limit: an fd that is closed without being deleted from the handler list never fires
+under kqueue (under `select()` it spins).
 
 ### Not yet measured on real hardware
 
