@@ -22,14 +22,23 @@
 # include <dlfcn.h>
 #endif
 
+/*
+ * The kqueue backend talks to the kernel through kevent64() (see kq64()
+ * below), which needs the arm64 Darwin syscall ABI; anywhere else
+ * WM_USE_KQUEUE is ignored and the select() path is used.
+ */
+#if defined(WM_USE_KQUEUE) && !(defined(__APPLE__) && defined(__arm64__))
+# undef WM_USE_KQUEUE
+#endif
+
 #ifdef WM_USE_KQUEUE
 # include <sys/event.h>
+# include <sys/syscall.h>
 # include <fcntl.h>
 # include <errno.h>
 # include <string.h>
 # include <pthread.h>
-# if defined(__APPLE__) && defined(NOTE_MACHTIME) && defined(NOTE_LEEWAY) && defined(__arm64__)
-#  include <sys/syscall.h>
+# if defined(NOTE_MACHTIME) && defined(NOTE_LEEWAY)
 #  define WM_KQ_TIMER		/* EVFILT_TIMER with NOTE_MACHTIME|NOTE_LEEWAY, see kq_timer_arm() */
 # endif
 #endif
@@ -412,6 +421,68 @@ void WMDeleteIdleHandler(WMHandlerID handlerID)
  */
 #define KQ_MAXEVENTS 32
 
+/*
+ * kevent64() as a raw syscall. All of this file's kqueue traffic uses it,
+ * for two reasons:
+ *  - EVFILT_TIMER's leeway travels in ext[1] (DAR-432), which legacy
+ *    kevent() cannot carry (it zero-fills the extension fields);
+ *  - a kqueue is either "legacy32" (kevent()) or not (kevent64()/
+ *    kevent_qos()) from its first use on, and the other flavour is refused
+ *    with EINVAL (bsd/kern/kern_event.c:6873-6877, kevent_get_kqfile), so
+ *    the wait, the registrations and the timer must all use one of them.
+ * This port's libsystem_kernel exports neither kevent64 nor kevent_qos,
+ * so the syscall (bsd/kern/syscalls.master:560, number SYS_kevent64) is
+ * made directly: arm64 Darwin takes the number in x16 with `svc #0x80`;
+ * carry set means failure, errno in x0 (bsd/dev/arm/systemcalls.c); on
+ * success x0 is the number of events returned.
+ * Returns that number, or -1 with errno set.
+ */
+static int kq64(int kq, const struct kevent64_s *change, int nchanges,
+		struct kevent64_s *events, int nevents, const struct timespec *timeout)
+{
+	register long x0 __asm__("x0") = kq;
+	register long x1 __asm__("x1") = (long)change;
+	register long x2 __asm__("x2") = nchanges;
+	register long x3 __asm__("x3") = (long)events;
+	register long x4 __asm__("x4") = nevents;
+	register long x5 __asm__("x5") = 0;
+	register long x6 __asm__("x6") = (long)timeout;
+	register long x16 __asm__("x16") = SYS_kevent64;
+	unsigned long failed;
+
+	__asm__ volatile ("svc #0x80\n\tcset %0, cs"
+			  : "=r" (failed), "+r" (x0), "+r" (x1)
+			  : "r" (x2), "r" (x3), "r" (x4), "r" (x5), "r" (x6), "r" (x16)
+			  : "memory", "cc");
+	if (failed) {
+		errno = (int)x0;
+		return -1;
+	}
+	return (int)x0;
+}
+
+static void kevTo64(const struct kevent *k, struct kevent64_s *k64, void *udata)
+{
+	memset(k64, 0, sizeof *k64);
+	k64->ident = k->ident;
+	k64->filter = k->filter;
+	k64->flags = k->flags;
+	k64->fflags = k->fflags;
+	k64->data = k->data;
+	k64->udata = (uint64_t)(uintptr_t)udata;
+}
+
+static void kevFrom64(const struct kevent64_s *k64, struct kevent *k)
+{
+	memset(k, 0, sizeof *k);
+	k->ident = (uintptr_t)k64->ident;
+	k->filter = k64->filter;
+	k->flags = k64->flags;
+	k->fflags = k64->fflags;
+	k->data = (intptr_t)k64->data;
+	k->udata = (void *)(uintptr_t)k64->udata;
+}
+
 typedef struct KQFilter {
 	struct kevent kev;
 	W_KQueueProc *proc;
@@ -430,6 +501,7 @@ static char kq_fd_tag;		/* udata of every fd-input registration */
 # define KQ_IS_TIMER_TAG(p)	((void *)(p) == (void *)&kq_timer_tag)
 static char kq_timer_tag;	/* udata of the timer-queue EVFILT_TIMER */
 static int kq_timer_ok = 1;	/* 0: unsupported here, use the kevent() timeout */
+static int kq_timer_errno;	/* errno of the registration that disabled it */
 static int kq_timer_armed;	/* a knote for (kq_timer_deadline, kq_timer_leeway) exists */
 static uint64_t kq_timer_deadline, kq_timer_leeway;
 static unsigned long stat_timer_arms, stat_timer_wakes;
@@ -448,10 +520,10 @@ static void kq_disable(void)
 
 static int kq_change(uintptr_t ident, int16_t filter, uint16_t flags, uint32_t fflags, void *udata)
 {
-	struct kevent ev;
+	struct kevent64_s ev;
 
-	EV_SET(&ev, ident, filter, flags, fflags, 0, udata);
-	return kevent(kq_fd, &ev, 1, NULL, 0, NULL);
+	EV_SET64(&ev, ident, filter, flags, fflags, 0, (uint64_t)(uintptr_t)udata, 0, 0);
+	return kq64(kq_fd, &ev, 1, NULL, 0, NULL);
 }
 
 /*
@@ -557,7 +629,7 @@ static int kq_init(void)
 W_KQueueID W_KQueueAddFilter(const struct kevent *kev, W_KQueueProc *proc, void *clientData)
 {
 	KQFilter *f;
-	struct kevent ev;
+	struct kevent64_s ev;
 
 	if (!kq_init())
 		return NULL;
@@ -567,10 +639,9 @@ W_KQueueID W_KQueueAddFilter(const struct kevent *kev, W_KQueueProc *proc, void 
 	f->proc = proc;
 	f->clientData = clientData;
 
-	ev = *kev;
+	kevTo64(kev, &ev, f);
 	ev.flags |= EV_ADD;
-	ev.udata = f;
-	if (kevent(kq_fd, &ev, 1, NULL, 0, NULL) < 0) {
+	if (kq64(kq_fd, &ev, 1, NULL, 0, NULL) < 0) {
 		wfree(f);
 		return NULL;
 	}
@@ -621,31 +692,9 @@ void W_KQueueDeleteFilter(W_KQueueID id)
  * Changing the registered deadline/leeway is a touch of the same knote
  * (filt_timertouch, kern_event.c:1665-1698), so re-arming needs no delete.
  *
- * The leeway field is ext[1], which only kevent64()/kevent_qos() can pass
- * (legacy kevent() zeroes it). This port's libsystem_kernel exports neither,
- * so the syscall (kevent64, bsd/kern/syscalls.master:560) is made directly:
- * arm64 Darwin takes the number in x16 and `svc #0x80`; carry set means
- * failure with errno in x0. The changelist has one entry and no eventlist.
+ * The leeway field is ext[1], which only kevent64() can pass here (see
+ * kq64() above).
  */
-static int kq_timer_syscall(int kq, const struct kevent64_s *change)
-{
-	register long x0 __asm__("x0") = kq;
-	register long x1 __asm__("x1") = (long)change;
-	register long x2 __asm__("x2") = 1;
-	register long x3 __asm__("x3") = 0;
-	register long x4 __asm__("x4") = 0;
-	register long x5 __asm__("x5") = 0;
-	register long x6 __asm__("x6") = 0;
-	register long x16 __asm__("x16") = SYS_kevent64;
-	unsigned long failed;
-
-	__asm__ volatile ("svc #0x80\n\tcset %0, cs"
-			  : "=r" (failed), "+r" (x0), "+r" (x1)
-			  : "r" (x2), "r" (x3), "r" (x4), "r" (x5), "r" (x6), "r" (x16)
-			  : "memory", "cc");
-	return failed ? -1 : 0;
-}
-
 static uint64_t timevalToAbs(const struct timeval *tv)
 {
 	uint64_t ns = (uint64_t)tv->tv_sec * 1000000000ULL + (uint64_t)tv->tv_usec * 1000ULL;
@@ -682,7 +731,8 @@ static int kq_timer_arm(void)
 	ev.data = (int64_t)deadline;
 	ev.udata = (uint64_t)(uintptr_t)&kq_timer_tag;
 	ev.ext[1] = leeway;
-	if (kq_timer_syscall(kq_fd, &ev) < 0) {
+	if (kq64(kq_fd, &ev, 1, NULL, 0, NULL) < 0) {
+		kq_timer_errno = errno;
 		kq_timer_ok = 0;
 		kq_timer_armed = 0;
 		return 0;
@@ -707,7 +757,7 @@ static void kq_timer_disarm(void)
 /* Returns -1 if the backend is unavailable (caller uses select). */
 static int kq_handleInputEvents(Bool waitForInput, int inputfd)
 {
-	struct kevent evs[KQ_MAXEVENTS];
+	struct kevent64_s evs[KQ_MAXEVENTS];
 	struct timespec ts, *tsp;
 	int nfds, nfilters, n, nevents, i, j;
 
@@ -755,12 +805,12 @@ static int kq_handleInputEvents(Bool waitForInput, int inputfd)
 		tsp = NULL;
 	}
 
-	n = kevent(kq_fd, NULL, 0, evs, KQ_MAXEVENTS, tsp);
+	n = kq64(kq_fd, NULL, 0, evs, KQ_MAXEVENTS, tsp);
 	nevents = n;
 #ifdef WM_KQ_TIMER
 	/* the queue's knote is one-shot: it is gone once delivered. It is not input. */
 	for (i = 0; i < n; i++) {
-		if (evs[i].udata == &kq_timer_tag) {
+		if (evs[i].udata == (uint64_t)(uintptr_t)&kq_timer_tag) {
 			kq_timer_armed = 0;
 			stat_timer_wakes++;
 			nevents--;
@@ -781,7 +831,7 @@ static int kq_handleInputEvents(Bool waitForInput, int inputfd)
 					continue;
 
 				for (j = 0; j < n; j++) {
-					if (evs[j].udata != &kq_fd_tag || (int)evs[j].ident != handler->fd)
+					if (evs[j].udata != (uint64_t)(uintptr_t)&kq_fd_tag || (int)evs[j].ident != handler->fd)
 						continue;
 					if (evs[j].filter == EVFILT_READ && (handler->mask & WIReadMask))
 						mask |= WIReadMask;
@@ -799,13 +849,17 @@ static int kq_handleInputEvents(Bool waitForInput, int inputfd)
 
 		/* then other filters; one may have been deleted by an earlier callback */
 		for (j = 0; j < n; j++) {
-			KQFilter *f = evs[j].udata;
+			KQFilter *f = (KQFilter *)(uintptr_t)evs[j].udata;
 
 			if (f == (KQFilter *) &kq_fd_tag || KQ_IS_TIMER_TAG(f) || !kq_filters ||
 			    WMGetFirstInArray(kq_filters, f) == WANotFound)
 				continue;
-			if (f->proc)
-				(*f->proc) (&evs[j], f->clientData);
+			if (f->proc) {
+				struct kevent ev;
+
+				kevFrom64(&evs[j], &ev);
+				(*f->proc) (&ev, f->clientData);
+			}
 			if ((f->kev.flags & EV_ONESHOT) && kq_filters &&
 			    WMGetFirstInArray(kq_filters, f) != WANotFound)
 				WMRemoveFromArray(kq_filters, f);
@@ -1224,9 +1278,9 @@ static void printStats(void)
 	}
 #ifdef WM_KQ_TIMER
 	fprintf(stderr, "WUtil event stats: t=%ld backend=%s blocking_waits=%lu with_input=%lu "
-		"ktimer=%s timer_arms=%lu timer_wakes=%lu\n",
+		"ktimer=%s errno=%d timer_arms=%lu timer_wakes=%lu\n",
 		(long)time(NULL), stat_backend, stat_waits, stat_woke,
-		kq_timer_ok ? "on" : "off", stat_timer_arms, stat_timer_wakes);
+		kq_timer_ok ? "on" : "off", kq_timer_errno, stat_timer_arms, stat_timer_wakes);
 #else
 	fprintf(stderr, "WUtil event stats: t=%ld backend=%s blocking_waits=%lu with_input=%lu\n",
 		(long)time(NULL), stat_backend, stat_waits, stat_woke);
