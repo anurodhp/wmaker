@@ -424,7 +424,7 @@ dock shows the same "Could not execute command" dialog the old exit status 111 p
 | `spawn_test bench`, parent holding 0 / 64 / 128 MB: ms per launch (child `exit 0`) | 668 / 1414 / 2058 | 622 / 604 / 613 |
 | same: parent CPU per launch | 45 / 641 / 1214 ms | 11.5 / 11 / 11 ms |
 
-`spawn_test` (28 checks) passes: SETSID, CLOEXEC_DEFAULT with and without `addinherit_np`, `adddup2`,
+`spawn_test` passes all its checks: SETSID, CLOEXEC_DEFAULT with and without `addinherit_np`, `adddup2`,
 envp, PATH search, ENOENT/EACCES/ENOEXEC, `EVFILT_PROC` status for an exit code and for SIGKILL
 (about 41 ms from kill to event), ESRCH on an already reaped pid. Under Xvfb (`tools/
 wm_spawn_verify_guest.sh e2e spawn|fork`): menu launches, dock AutoLaunch, `WindowRelaunchKey`
