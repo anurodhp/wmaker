@@ -3056,6 +3056,19 @@ void wDockSwap(WDock *dock)
 	wScreenUpdateUsableArea(scr);
 }
 
+typedef struct {
+	WScreen *scr;
+	char msg[PATH_MAX];
+} SpawnFailure;
+
+static void spawnFailureDialog(void *data)
+{
+	SpawnFailure *f = data;
+
+	wMessageDialog(f->scr, _("Error"), f->msg, _("OK"), NULL, NULL);
+	wfree(f);
+}
+
 static pid_t execCommand(WAppIcon *btn, const char *command, WSavedState *state)
 {
 	WScreen *scr = btn->icon->core->screen_ptr;
@@ -3099,8 +3112,18 @@ static pid_t execCommand(WAppIcon *btn, const char *command, WSavedState *state)
 	args[argc] = NULL;
 
 	pid = wSpawn(scr, argv[0], args, -1, -1, WSpawnQoSDefault);
-	if (pid < 0)
-		werror(_("could not execute \"%s\": %s"), argv[0], strerror(errno));
+	if (pid < 0) {
+		SpawnFailure *f = wmalloc(sizeof(SpawnFailure));
+		int err = errno;
+
+		werror(_("could not execute \"%s\": %s"), argv[0], strerror(err));
+		/* A forked child that failed to exec exited with 111 and trackDeadProcess()
+		 * then showed this dialog; spawn reports the failure at once, so show the
+		 * same dialog, from the main loop like the death handler did. */
+		f->scr = scr;
+		snprintf(f->msg, sizeof(f->msg), _("Could not execute command \"%s\""), command);
+		WMAddTimerHandler(0, spawnFailureDialog, f);
+	}
 	free(args);
 	wtokenfree(argv, argc);
 
