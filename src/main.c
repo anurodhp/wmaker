@@ -381,7 +381,7 @@ Bool RelaunchWindow(WWindow *wwin)
 		setsid();
 #endif
 		/* argv is not null-terminated */
-		char **a = (char **) malloc(argc + 1);
+		char **a = (char **) malloc(sizeof(char *) * (argc + 1));
 		if (! a) {
 			werror("out of memory trying to relaunch the application");
 			Exit(-1);
