@@ -330,7 +330,7 @@ pid_t wSpawn(WScreen *scr, const char *file, char *const argv[], int stdin_fd, i
 			nSpawned++;
 			watchExit(pid);
 		}
-		TRACE("posix_spawnp %s: pid %d (%s) [spawned %lu] t0=%.3f call=%.3f ms", file, (int) pid,
+		TRACE("posix_spawnp %s %s: pid %d (%s) [spawned %lu] t0=%.3f call=%.3f ms", file, argv[1] ? (argv[2] ? argv[2] : argv[1]) : "", (int) pid,
 		      pid < 0 ? strerror(errno) : "ok", nSpawned, t0, tracing() ? nowMs() - t0 : 0);
 		return pid;
 	}
