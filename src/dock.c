@@ -60,6 +60,8 @@
 #include "placement.h"
 #include "misc.h"
 #include "event.h"
+#include "launch.h"
+#include <errno.h>
 
 /**** Local variables ****/
 #define CLIP_REWIND       1
@@ -3059,7 +3061,8 @@ static pid_t execCommand(WAppIcon *btn, const char *command, WSavedState *state)
 	WScreen *scr = btn->icon->core->screen_ptr;
 	pid_t pid;
 	char **argv;
-	int argc;
+	char **args;
+	int argc, i;
 	char *cmdline;
 
 	cmdline = ExpandOptions(scr, command);
@@ -3082,28 +3085,23 @@ static pid_t execCommand(WAppIcon *btn, const char *command, WSavedState *state)
 		return 0;
 	}
 
-	pid = fork();
-	if (pid == 0) {
-		char **args;
-		int i;
-
-		SetupEnvironment(scr);
-
-#ifdef HAVE_SETSID
-		setsid();
-#endif
-
-		args = malloc(sizeof(char *) * (argc + 1));
-		if (!args)
-			exit(111);
-
-		for (i = 0; i < argc; i++)
-			args[i] = argv[i];
-
-		args[argc] = NULL;
-		execvp(argv[0], args);
-		exit(111);
+	/* DAR-434: argv is not NULL-terminated; wSpawn needs it to be */
+	args = malloc(sizeof(char *) * (argc + 1));
+	if (!args) {
+		wtokenfree(argv, argc);
+		wfree(cmdline);
+		if (state)
+			wfree(state);
+		return 0;
 	}
+	for (i = 0; i < argc; i++)
+		args[i] = argv[i];
+	args[argc] = NULL;
+
+	pid = wSpawn(scr, argv[0], args, -1, -1, WSpawnQoSDefault);
+	if (pid < 0)
+		werror(_("could not execute \"%s\": %s"), argv[0], strerror(errno));
+	free(args);
 	wtokenfree(argv, argc);
 
 	if (pid > 0) {

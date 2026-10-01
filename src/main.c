@@ -57,6 +57,8 @@
 #include "main.h"
 #include "monitor.h"
 #include "misc.h"
+#include "launch.h"
+#include <errno.h>
 
 #include <WINGs/WUtil.h>
 
@@ -238,10 +240,18 @@ void Restart(char *manager, Bool abortOnFailure)
 		exit(7);
 }
 
-void SetupEnvironment(WScreen * scr)
+/*
+ * The variables a launched program needs to find this screen: DISPLAY with
+ * the screen number (multihead) and WRASTER_COLOR_RESOLUTION<screen>.
+ * Fills out[] (room for 2) with malloc'ed "NAME=value" strings, returns how
+ * many. SetupEnvironment() putenv()s them in a forked child, wSpawn()
+ * (launch.c) puts them in the envp of a posix_spawn()ed one.
+ */
+int WSetupEnvironmentStrings(WScreen * scr, char *out[2])
 {
 	char *tmp, *ptr;
 	char buf[16];
+	int n = 0;
 
 	if (multiHead) {
 		int len = strlen(DisplayName) + 64;
@@ -265,12 +275,24 @@ void SetupEnvironment(WScreen * scr)
 		}
 		snprintf(buf, sizeof(buf), ".%i", scr->screen);
 		strcat(tmp, buf);
-		putenv(tmp);
+		out[n++] = tmp;
 	}
 	tmp = wmalloc(60);
 	snprintf(tmp, 60, "WRASTER_COLOR_RESOLUTION%i=%i", scr->screen,
 		 scr->rcontext->attribs->colors_per_channel);
-	putenv(tmp);
+	out[n++] = tmp;
+	return n;
+}
+
+void SetupEnvironment(WScreen * scr)
+{
+	char *strs[2];
+	int i, n;
+
+	n = WSetupEnvironmentStrings(scr, strs);
+	/* putenv() keeps the string: they stay allocated, as before */
+	for (i = 0; i < n; i++)
+		putenv(strs[i]);
 }
 
 typedef struct {
@@ -319,20 +341,16 @@ void ExecuteShellCommand(WScreen *scr, const char *command)
 	 */
 	shell = "/bin/sh";
 
-	pid = fork();
+	{
+		char *argv[4] = { (char *) shell, "-c", (char *) command, NULL };
 
-	if (pid == 0) {
+		/* DAR-434: posix_spawn (launch.c); the old fork + SetupEnvironment +
+		 * setsid + execl is its run-time fallback (WM_SPAWN=fork) */
+		pid = wSpawn(scr, shell, argv, -1, -1, WSpawnQoSDefault);
+	}
 
-		SetupEnvironment(scr);
-
-#ifdef HAVE_SETSID
-		setsid();
-#endif
-		execl(shell, shell, "-c", command, NULL);
-		werror("could not execute %s -c %s", shell, command);
-		Exit(-1);
-	} else if (pid < 0) {
-		werror("cannot fork a new process");
+	if (pid < 0) {
+		werror("could not execute %s -c %s: %s", shell, command, strerror(errno));
 	} else {
 		_tuple *data = wmalloc(sizeof(_tuple));
 
@@ -373,29 +391,26 @@ Bool RelaunchWindow(WWindow *wwin)
 		wtokensplit(command, &argv, &argc);
 
 
-	pid_t pid = fork();
+	/* argv is not null-terminated */
+	char **a = (char **) malloc(sizeof(char *) * (argc + 1));
+	if (! a) {
+		werror("out of memory trying to relaunch the application");
+		wtokenfree(argv, argc);
+		wfree(command);
+		return False;
+	}
 
-	if (pid == 0) {
-		SetupEnvironment(wwin->screen_ptr);
-#ifdef HAVE_SETSID
-		setsid();
-#endif
-		/* argv is not null-terminated */
-		char **a = (char **) malloc(sizeof(char *) * (argc + 1));
-		if (! a) {
-			werror("out of memory trying to relaunch the application");
-			Exit(-1);
-		}
+	int i;
+	for (i = 0; i < argc; i++)
+		a[i] = argv[i];
+	a[i] = NULL;
 
-		int i;
-		for (i = 0; i < argc; i++)
-			a[i] = argv[i];
-		a[i] = NULL;
+	/* DAR-434: posix_spawnp (execvp's PATH search and ENOEXEC fallback) */
+	pid_t pid = wSpawn(wwin->screen_ptr, a[0], a, -1, -1, WSpawnQoSDefault);
+	free(a);
 
-		execvp(a[0], a);
-		Exit(-1);
-	} else if (pid < 0) {
-		werror("cannot fork a new process");
+	if (pid < 0) {
+		werror("cannot relaunch %s: %s", argv[0], strerror(errno));
 
 		wtokenfree(argv, argc);
 		wfree(command);

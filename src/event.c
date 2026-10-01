@@ -76,6 +76,7 @@
 #include "shutdown.h"
 #include "misc.h"
 #include "event.h"
+#include "launch.h"
 #include "winmenu.h"
 #include "switchmenu.h"
 #include "wsmap.h"
@@ -484,6 +485,13 @@ void NotifyDeadProcess(pid_t pid, unsigned char status)
 	deadProcessPtr++;
 }
 
+/* DAR-434: the kqueue child-exit callback (launch.c) dispatches from here. */
+void wDispatchDeadProcesses(void)
+{
+	if (deathHandlers)
+		handleDeadProcess();
+}
+
 static void handleDeadProcess(void)
 {
 	DeathHandler *tmp;
@@ -491,6 +499,9 @@ static void handleDeadProcess(void)
 
 	for (i = 0; i < deadProcessPtr; i++) {
 		wWindowDeleteSavedStatesForPID(deadProcesses[i].pid);
+		/* DAR-434: the pid is gone; drop its EVFILT_PROC watch if the
+		 * SIGCHLD path got here first */
+		wSpawnForget(deadProcesses[i].pid);
 	}
 
 	if (!deathHandlers) {

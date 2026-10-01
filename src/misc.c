@@ -54,6 +54,7 @@
 #include "xmodifier.h"
 #include "main.h"
 #include "event.h"
+#include "launch.h"
 #include "shutdown.h"
 
 
@@ -977,6 +978,7 @@ static void track_bg_helper_death(pid_t pid, unsigned int status, void *client_d
 Bool start_bg_helper(WScreen *scr)
 {
 	pid_t pid;
+	int spawn_errno;
 	int filedes[2];
 
 	if (pipe(filedes) < 0) {
@@ -985,43 +987,37 @@ Bool start_bg_helper(WScreen *scr)
 		return False;
 	}
 
-	pid = fork();
+	{
+		/* DAR-434: posix_spawnp; filedes[0] becomes the helper's stdin, and
+		 * filedes[1] (the parent's end) is not inherited by the child
+		 * (CLOEXEC_DEFAULT, or close_fd in the fork fallback). util/wmsetbg
+		 * is not built by this port's build_wmaker.sh, so this launch is
+		 * untested here (the failure branch is). */
+		const char *dither = wPreferences.no_dithering ? "-m" : "-d";
+		char *argv[6];
+		int n = 0;
+
+		argv[n++] = "wmsetbg";
+		argv[n++] = "-helper";
+		if (wPreferences.smooth_workspace_back)
+			argv[n++] = "-S";
+		argv[n++] = (char *) dither;
+		argv[n] = NULL;
+
+		pid = wSpawn(scr, "wmsetbg", argv, filedes[0], filedes[1], WSpawnQoSUtility);
+	}
+	spawn_errno = errno;
+	/* We don't need this side of the pipe in the parent process */
+	close(filedes[0]);
+
 	if (pid < 0) {
+		werror(_("could not execute \"%s\": %s"), "wmsetbg", strerror(spawn_errno));
 		werror(_("%s failed, can't set workspace specific background image (%s)"),
-		       "fork()", strerror(errno));
-		close(filedes[0]);
+		       "spawn", strerror(spawn_errno));
 		close(filedes[1]);
 		return False;
 
-	} else if (pid == 0) {
-		const char *dither;
-
-		/* We don't need this side of the pipe in the child process */
-		close(filedes[1]);
-
-		SetupEnvironment(scr);
-
-		close(STDIN_FILENO);
-		if (dup2(filedes[0], STDIN_FILENO) < 0) {
-			werror(_("%s failed, can't set workspace specific background image (%s)"),
-			       "dup2()", strerror(errno));
-			exit(1);
-		}
-		close(filedes[0]);
-
-		dither = wPreferences.no_dithering ? "-m" : "-d";
-		if (wPreferences.smooth_workspace_back)
-			execlp("wmsetbg", "wmsetbg", "-helper", "-S", dither, NULL);
-		else
-			execlp("wmsetbg", "wmsetbg", "-helper", dither, NULL);
-
-		werror(_("could not execute \"%s\": %s"), "wmsetbg", strerror(errno));
-		exit(1);
-
 	} else {
-		/* We don't need this side of the pipe in the parent process */
-		close(filedes[0]);
-
 		if (fcntl(filedes[1], F_SETFD, FD_CLOEXEC) < 0)
 			wwarning(_("could not set close-on-exec flag for bg_helper's communication file handle (%s)"),
 			         strerror(errno));

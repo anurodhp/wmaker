@@ -82,6 +82,7 @@
 #include "appicon.h"
 #include "dock.h"
 #include "misc.h"
+#include "launch.h"
 
 #include <WINGs/WUtil.h>
 
@@ -375,22 +376,21 @@ static pid_t execCommand(WScreen *scr, char *command)
 		return 0;
 	}
 
-	pid = fork();
-	if (pid == 0) {
-		char **args;
+	/* DAR-434: argv is not NULL-terminated; wSpawn needs it to be. Unlike the
+	 * fork it replaces, this child is also put in its own session. */
+	{
+		char **args = malloc(sizeof(char *) * (argc + 1));
 		int i;
 
-		SetupEnvironment(scr);
-
-		args = malloc(sizeof(char *) * (argc + 1));
-		if (!args)
-			exit(111);
-		for (i = 0; i < argc; i++) {
-			args[i] = argv[i];
+		if (!args) {
+			wtokenfree(argv, argc);
+			return -1;
 		}
+		for (i = 0; i < argc; i++)
+			args[i] = argv[i];
 		args[argc] = NULL;
-		execvp(argv[0], args);
-		exit(111);
+		pid = wSpawn(scr, argv[0], args, -1, -1, WSpawnQoSDefault);
+		free(args);
 	}
 	wtokenfree(argv, argc);
 	return pid;

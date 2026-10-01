@@ -38,5 +38,6 @@ Bool IsDoubleClick(WScreen *scr, XEvent *event);
 
 /* called from the signal handler */
 void NotifyDeadProcess(pid_t pid, unsigned char status);
+void wDispatchDeadProcesses(void);
 
 #endif /* WMEVENT_H */
