@@ -25,6 +25,7 @@ boots); numbers for the real Pi are noted as pending where they have not been ta
 | Monotonic, coalesced timers (`NOTE_MACHTIME` + `NOTE_LEEWAY`) | this fork (DAR-432) | Done on QEMU | Timers survive `settimeofday()` steps. Idle wake-ups about 1.0 per second to about 0.35 per second; idle CPU about 0.9 s to about 0.35 s per 60 s (see below). |
 | `EVFILT_VNODE` watch of `~/GNUstep/Defaults` instead of 2 s `stat()` polling | this fork (DAR-433) | Done on QEMU | Idle wake-ups about 0.35 per second to about 0.03 per second; idle CPU about 0.4 s to about 0.06 s per 60 s; a changed defaults file is reloaded within about 0.2 s (see below). |
 | Main threads of Xorg and wmaker at `QOS_CLASS_USER_INTERACTIVE` | this fork, `src/main.c` (branch `dar-439-qos`), and the puredarwingop Xorg driver (PureDarwin fork branch `dar-439-qos`) (DAR-439 step 2) | Built, QEMU-measured, real Pi pending | Base priority 31 to 37 (not 46). QEMU, one core, under CPU hogs: 95th percentile window-move round trip 140-154 ms to 41-45 ms (4 hogs), 43 ms to 27-31 ms (1 hog). Idle median round trip rose about 11.5 ms to 14-19 ms. See section 6. |
+| Launch programs with `posix_spawnp` and watch exits with `EVFILT_PROC` instead of fork+exec and SIGCHLD | this fork, `src/launch.c` (branch `dar-434-spawn`) (DAR-434) | Done on QEMU, real Pi pending | wmaker is blocked about 26 ms per launch instead of about 100 ms (QEMU); fork+exec cost grows with the parent (0 / 64 / 128 MB parent: 45 / 640 / 1210 ms of parent CPU per launch), spawn stays at about 11 ms. Children no longer inherit wmaker's descriptors. See section 7. |
 
 ### 1. Session priority (biggest user-visible win)
 
@@ -383,6 +384,61 @@ which is the priority inversion the ticket warned about. Cost: the idle median i
 higher (about 25 to 60 percent) with both raised. Cause not found; the test
 client stays at 31, and the loaded tail improves in the same runs. The real Pi is not measured;
 check `ps -o pid,pri,comm` (Xorg and wmaker 37, apps 31) and Xorg.0.log.
+
+### 7. `posix_spawnp` launches and `EVFILT_PROC` child exits (DAR-434, this fork)
+
+**What changed.** `src/launch.c` has `wSpawn()`, used by `ExecuteShellCommand`, the relaunch path
+(`RelaunchWindow`), dock/clip launches (`dock.c execCommand`), the `wmsetbg` helper
+(`start_bg_helper`) and session restore. It calls `posix_spawnp` with `POSIX_SPAWN_SETSID |
+POSIX_SPAWN_CLOEXEC_DEFAULT` (xnu `bsd/sys/spawn.h`; `kern_exec.c:2533-2575` marks only the
+descriptors named in the file actions inheritable, `:3749` is SETSID). Only stdin/stdout/stderr
+(`addinherit_np`, or `adddup2` for the helper's stdin pipe) reach the child; `SetupEnvironment()`'s
+variables (DISPLAY for multihead, `WRASTER_COLOR_RESOLUTION`) go in an envp. The helper gets a
+UTILITY clamp. Also fixed on the way, first and on its own: the relaunch path's
+`malloc(argc + 1)` (bytes, not pointers) heap overflow, commit `b7c3afc2`.
+
+`posix_spawnp` comes from this port's libsystem_c (`build_libsystem_c.sh` compiles Libc
+`sys/posix_spawn.c:70`): PATH search and `execvp`'s ENOEXEC fallback to `/bin/sh` (`:142-154`).
+Plain `posix_spawn` does not do the fallback (it returns ENOEXEC); `tools/userland_staging/
+spawn_test` checks both.
+
+**Reaping.** Each child gets an `EVFILT_PROC` knote (`NOTE_EXIT | NOTE_EXITSTATUS`, `EV_ONESHOT`)
+on the WUtil kqueue (`W_KQueueAddFilter`); `data` is the wait status. The callback does
+`waitpid(pid, WNOHANG)`, queues the status with `NotifyDeadProcess()` and wakes the main loop with a
+ClientMessage on wmaker's own window, so the death handlers run in `DispatchEvent()` as before.
+Not from a timer: death handlers open modal dialogs, and WUtil's timer loop is not re-entrant
+(a first version used a zero-delay timer and wmaker died with SIGBUS after the error dialog was
+dismissed). xnu raises `NOTE_EXIT` before the process is a zombie (`kern_exit.c:1579` vs `:1642`
+`SZOMB` and `:1648` SIGCHLD), so the `waitpid` in the callback usually finds nothing; the SIGCHLD
+handler (`startup.c buryChild`, still installed) reaps it a moment later. Handlers fire once either
+way (a handler is removed when it runs). Children not spawned through `wSpawn()` and the select
+backend rely on SIGCHLD alone, as before. A failed spawn (no such program) is reported at once; the
+dock shows the same "Could not execute command" dialog the old exit status 111 produced.
+`WM_SPAWN=fork` selects the old fork+exec at run time; `WM_SPAWN_TRACE=1` logs launches and deaths.
+
+**QEMU results** (one core; QEMU timings are indicative only; the host was shared):
+
+| Measure | fork+exec | posix_spawn |
+|---|---|---|
+| wmaker blocked in the launch call (wmaker, 8 MB RSS), per launch | 76-155 ms, about 100 ms | 20-40 ms, about 26 ms |
+| `spawn_test bench`, parent holding 0 / 64 / 128 MB: ms per launch (child `exit 0`) | 668 / 1414 / 2058 | 622 / 604 / 613 |
+| same: parent CPU per launch | 45 / 641 / 1214 ms | 11.5 / 11 / 11 ms |
+
+`spawn_test` (28 checks) passes: SETSID, CLOEXEC_DEFAULT with and without `addinherit_np`, `adddup2`,
+envp, PATH search, ENOENT/EACCES/ENOEXEC, `EVFILT_PROC` status for an exit code and for SIGKILL
+(about 41 ms from kill to event), ESRCH on an already reaped pid. Under Xvfb (`tools/
+wm_spawn_verify_guest.sh e2e spawn|fork`): menu launches, dock AutoLaunch, `WindowRelaunchKey`
+relaunch, kill of a long-running child (reported by the kqueue path, status 0xf, no zombies), a child
+sees only fds 0 and 2 plus its redirect. Children and wmaker show the same thread base priority
+(`qos_probe`); `posix_spawnattr_set_qos_class_np` only accepts UTILITY/BACKGROUND/MAINTENANCE
+(libpthread `qos.c:571`; they are ceilings), so user launches keep the default and nothing is boosted.
+
+**Not measured / caveats.** The real Pi. The end-to-end launch latency through the menu (child's first
+instruction minus the call) is about 2 s on QEMU, almost all `/bin/sh` and dyld start-up, so it does not
+compare the two; and the fork variant of that harness (`wm_spawn_verify_guest.sh lat fork`) never got a
+menu click through on QEMU (the fork e2e run did), cause not found. `util/wmsetbg` is not built here,
+so the helper launch is untested (its error path is the same code). Session restore now also starts
+apps in their own session.
 
 ### Not yet measured on real hardware
 
