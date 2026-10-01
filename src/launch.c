@@ -48,6 +48,7 @@
 #include <time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <mach/mach_time.h>
 
 #include <WINGs/WUtil.h>
 
@@ -72,6 +73,16 @@
 
 static int traceOn = -1;
 static unsigned long nSpawned, nForked, nKqDeaths, nKqReaped, nFallbackDeaths;
+
+/* ms on mach_absolute_time, the clock a child can read for itself (spawn_test --child stamp) */
+static double nowMs(void)
+{
+	static mach_timebase_info_data_t tb;
+
+	if (!tb.denom)
+		mach_timebase_info(&tb);
+	return (double) mach_absolute_time() * tb.numer / tb.denom / 1e6;
+}
 
 static int tracing(void)
 {
@@ -306,6 +317,7 @@ static pid_t forkProgram(WScreen *scr, const char *file, char *const argv[], int
 pid_t wSpawn(WScreen *scr, const char *file, char *const argv[], int stdin_fd, int close_fd, int qos)
 {
 	pid_t pid;
+	double t0 = tracing() ? nowMs() : 0;
 
 #ifdef WM_USE_POSIX_SPAWN
 	if (useSpawn < 0) {
@@ -318,8 +330,8 @@ pid_t wSpawn(WScreen *scr, const char *file, char *const argv[], int stdin_fd, i
 			nSpawned++;
 			watchExit(pid);
 		}
-		TRACE("posix_spawnp %s: pid %d (%s) [spawned %lu]", file, (int) pid,
-		      pid < 0 ? strerror(errno) : "ok", nSpawned);
+		TRACE("posix_spawnp %s: pid %d (%s) [spawned %lu] t0=%.3f call=%.3f ms", file, (int) pid,
+		      pid < 0 ? strerror(errno) : "ok", nSpawned, t0, tracing() ? nowMs() - t0 : 0);
 		return pid;
 	}
 #endif
@@ -327,7 +339,8 @@ pid_t wSpawn(WScreen *scr, const char *file, char *const argv[], int stdin_fd, i
 	pid = forkProgram(scr, file, argv, stdin_fd, close_fd);
 	if (pid > 0)
 		nForked++;
-	TRACE("fork+exec %s: pid %d [forked %lu]", file, (int) pid, nForked);
+	TRACE("fork+exec %s: pid %d [forked %lu] t0=%.3f call=%.3f ms", file, (int) pid, nForked,
+	      t0, tracing() ? nowMs() - t0 : 0);
 	return pid;
 }
 
