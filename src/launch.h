@@ -39,6 +39,10 @@
  */
 pid_t wSpawn(WScreen *scr, const char *file, char *const argv[], int stdin_fd, int close_fd, int qos);
 
+/* Make the main loop run DispatchEvent() soon (death handlers are run there):
+ * sends this process a ClientMessage on scr's info window. */
+void wSpawnWake(WScreen *scr);
+
 /* Called with every pid the SIGCHLD path or the kqueue reported dead:
  * drops the pid's EVFILT_PROC watch, if it still has one. */
 void wSpawnForget(pid_t pid);

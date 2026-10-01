@@ -3061,10 +3061,13 @@ typedef struct {
 	char msg[PATH_MAX];
 } SpawnFailure;
 
-static void spawnFailureDialog(void *data)
+/* runs as a death handler (from DispatchEvent), where the 111 exit used to be handled */
+static void spawnFailureDialog(pid_t pid, unsigned int status, void *data)
 {
 	SpawnFailure *f = data;
 
+	(void) pid;
+	(void) status;
 	wMessageDialog(f->scr, _("Error"), f->msg, _("OK"), NULL, NULL);
 	wfree(f);
 }
@@ -3119,10 +3122,17 @@ static pid_t execCommand(WAppIcon *btn, const char *command, WSavedState *state)
 		werror(_("could not execute \"%s\": %s"), argv[0], strerror(err));
 		/* A forked child that failed to exec exited with 111 and trackDeadProcess()
 		 * then showed this dialog; spawn reports the failure at once, so show the
-		 * same dialog, from the main loop like the death handler did. */
+		 * same dialog, through the death handlers like that one. */
 		f->scr = scr;
 		snprintf(f->msg, sizeof(f->msg), _("Could not execute command \"%s\""), command);
-		WMAddTimerHandler(0, spawnFailureDialog, f);
+		{
+			static pid_t fakePid = -2;	/* a pid that no process has */
+
+			wAddDeathHandler(fakePid, spawnFailureDialog, f);
+			NotifyDeadProcess(fakePid, 111);
+			fakePid--;
+		}
+		wSpawnWake(scr);
 	}
 	free(args);
 	wtokenfree(argv, argc);

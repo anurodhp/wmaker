@@ -22,8 +22,12 @@
  * waitpid(-1) from signal context. With the kqueue backend each spawned
  * pid also gets an EVFILT_PROC knote, NOTE_EXIT|NOTE_EXITSTATUS (xnu
  * bsd/sys/event.h; data is the wait status, kern_event.c filt_procevent),
- * so the death handlers run from the main loop (a zero-delay timer, so
- * death handlers that open dialogs do not run inside the kevent batch).
+ * so the death handlers run from the main loop: the callback sends the
+ * window manager a ClientMessage on its own window (wSpawnWake) and the
+ * event handler, DispatchEvent(), runs them first thing, in the context
+ * they always ran in. Not from a timer or the kevent callback: death
+ * handlers open modal dialogs (nested event loops), and WUtil's timer and
+ * kevent dispatch loops are not re-entrant.
  * xnu raises NOTE_EXIT before the process turns into a zombie
  * (kern_exit.c:1579 proc_knote, 1642 p_stat = SZOMB, 1648 psignal SIGCHLD),
  * so the waitpid(pid, WNOHANG) here often finds nothing yet; the SIGCHLD
@@ -161,7 +165,7 @@ typedef struct Watch {
 } Watch;
 
 static Watch *watches;
-static WMHandlerID dispatchTimer;
+static WScreen *wakeScreen;
 
 static void removeWatch(pid_t pid, int deleteFilter)
 {
@@ -176,13 +180,6 @@ static void removeWatch(pid_t pid, int deleteFilter)
 			return;
 		}
 	}
-}
-
-static void dispatchDeaths(void *data)
-{
-	(void) data;
-	dispatchTimer = NULL;
-	wDispatchDeadProcesses();
 }
 
 static void procExit(const struct kevent *ev, void *clientData)
@@ -213,8 +210,7 @@ static void procExit(const struct kevent *ev, void *clientData)
 	NotifyDeadProcess(pid, WEXITSTATUS(wstatus));
 	sigprocmask(SIG_SETMASK, &old, NULL);
 
-	if (!dispatchTimer)
-		dispatchTimer = WMAddTimerHandler(0, dispatchDeaths, NULL);
+	wSpawnWake(wakeScreen);
 }
 
 static void watchExit(pid_t pid)
@@ -314,10 +310,33 @@ static pid_t forkProgram(WScreen *scr, const char *file, char *const argv[], int
 	return pid;
 }
 
+void wSpawnWake(WScreen *scr)
+{
+	XEvent ev;
+	static Atom wake;
+
+	if (!scr || !dpy)
+		return;
+	if (!wake)
+		wake = XInternAtom(dpy, "_WM_SPAWN_WAKE", False);
+	memset(&ev, 0, sizeof(ev));
+	ev.xclient.type = ClientMessage;
+	ev.xclient.window = scr->info_window;
+	ev.xclient.message_type = wake;
+	ev.xclient.format = 32;
+	/* empty mask: delivered to the client that owns the window, i.e. us */
+	XSendEvent(dpy, scr->info_window, False, NoEventMask, &ev);
+	XFlush(dpy);
+}
+
 pid_t wSpawn(WScreen *scr, const char *file, char *const argv[], int stdin_fd, int close_fd, int qos)
 {
 	pid_t pid;
 	double t0 = tracing() ? nowMs() : 0;
+
+#if defined(WM_USE_POSIX_SPAWN) && defined(WM_USE_KQUEUE)
+	wakeScreen = scr;
+#endif
 
 #ifdef WM_USE_POSIX_SPAWN
 	if (useSpawn < 0) {
