@@ -349,7 +349,7 @@
 #define MAX_WINDOW_SHORTCUTS      10
 #define MIN_TITLEFONT_HEIGHT(h)   ((h)>14 ? (h) : 14)
 #define TITLEBAR_HEIGHT           18  /* window's titlebar height */
-#define RESIZEBAR_HEIGHT          8   /* height of the resizebar */
+#define RESIZEBAR_HEIGHT          (wPreferences.mac_chrome ? 3 : 8)  /* height of the resizebar */
 #define RESIZEBAR_MIN_WIDTH       20  /* min width of handles-corner_width */
 #define RESIZEBAR_CORNER_WIDTH    28  /* width of the corner of resizebars */
 #define MENU_INDICATOR_SPACE      12

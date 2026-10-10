@@ -41,6 +41,7 @@
 #define WFF_LANGUAGE_BUTTON	(1<<6)
 #endif
 #define WFF_SELECTED	(1<<7)
+#define WFF_ZOOM_BUTTON	(1<<8)
 
 
 #define WFF_IS_SHADED	(1<<16)
@@ -56,6 +57,7 @@ typedef struct WFrameWindow {
     WCoreWindow *language_button;
 #endif
     WCoreWindow *right_button;	       /* close button */
+    WCoreWindow *zoom_button;	       /* maximize button (MacChrome only) */
 
     short workspace;		       /* workspace that the window occupies */
 
@@ -107,6 +109,7 @@ typedef struct WFrameWindow {
     void (*on_click_right)(WCoreWindow *sender, void *data, XEvent *event);
     void (*on_dblclick_right)(WCoreWindow *sender, void *data, XEvent *event);
 
+    void (*on_click_zoom)(WCoreWindow *sender, void *data, XEvent *event);
     void (*on_mousedown_titlebar)(WCoreWindow *sender, void *data, XEvent *event);
     void (*on_dblclick_titlebar)(WCoreWindow *sender, void *data, XEvent *event);
 
@@ -119,6 +122,7 @@ typedef struct WFrameWindow {
         unsigned int resizebar:1;
         unsigned int left_button:1;
         unsigned int right_button:1;
+        unsigned int zoom_button:1;
 #ifdef XKB_BUTTON_HINT
         unsigned int language_button:1;
 #endif
@@ -129,6 +133,7 @@ typedef struct WFrameWindow {
 
         unsigned int hide_left_button:1;
         unsigned int hide_right_button:1;
+        unsigned int hide_zoom_button:1;
 #ifdef XKB_BUTTON_HINT
         unsigned int hide_language_button:1;
 #endif
@@ -137,6 +142,7 @@ typedef struct WFrameWindow {
 
         unsigned int lbutton_dont_fit:1;
         unsigned int rbutton_dont_fit:1;
+        unsigned int zbutton_dont_fit:1;
 #ifdef XKB_BUTTON_HINT
         unsigned int languagebutton_dont_fit:1;
 #endif
@@ -154,6 +160,8 @@ typedef struct WFrameWindow {
     unsigned long *border_pixel;
     unsigned long *focused_border_pixel;
     unsigned long *selected_border_pixel;
+    unsigned long mac_pixel[8];	       /* MacChrome: red/yellow/green/gray fills, then outlines */
+    unsigned int mac_pixel_ok:1;
 } WFrameWindow;
 
 

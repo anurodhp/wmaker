@@ -93,6 +93,9 @@ static void windowCloseDblClick(WCoreWindow *sender, void *data, XEvent *event);
 /* iconify button */
 static void windowIconifyClick(WCoreWindow *sender, void *data, XEvent *event);
 
+/* zoom button (MacChrome) */
+static void windowZoomClick(WCoreWindow *sender, void *data, XEvent *event);
+
 #ifdef XKB_BUTTON_HINT
 static void windowLanguageClick(WCoreWindow *sender, void *data, XEvent *event);
 #endif
@@ -1143,6 +1146,8 @@ WWindow *wManageWindow(WScreen *scr, Window window)
 
 	/* Create frame, borders and do reparenting */
 	foo = WFF_LEFT_BUTTON | WFF_RIGHT_BUTTON;
+	if (wPreferences.mac_chrome && IS_RESIZABLE(wwin))
+		foo |= WFF_ZOOM_BUTTON;
 #ifdef XKB_BUTTON_HINT
 	if (wPreferences.modelock)
 		foo |= WFF_LANGUAGE_BUTTON;
@@ -1192,6 +1197,7 @@ WWindow *wManageWindow(WScreen *scr, Window window)
 	wwin->frame->child = wwin;
 	wwin->frame->workspace = workspace;
 	wwin->frame->on_click_left = windowIconifyClick;
+	wwin->frame->on_click_zoom = windowZoomClick;
 
 #ifdef XKB_BUTTON_HINT
 	if (wPreferences.modelock)
@@ -2362,6 +2368,8 @@ void wWindowConfigureBorders(WWindow *wwin)
 		int newy, oldh;
 
 		flags = WFF_LEFT_BUTTON | WFF_RIGHT_BUTTON;
+		if (wPreferences.mac_chrome && IS_RESIZABLE(wwin))
+			flags |= WFF_ZOOM_BUTTON;
 
 #ifdef XKB_BUTTON_HINT
 	if (wPreferences.modelock)
@@ -3162,6 +3170,24 @@ static void windowLanguageClick(WCoreWindow *sender, void *data, XEvent *event)
 	wRaiseFrame(fwin->core);
 }
 #endif
+
+/* same toggle as the window menu's Maximize entry (winmenu.c, MC_MAXIMIZE) */
+static void windowZoomClick(WCoreWindow *sender, void *data, XEvent *event)
+{
+	WWindow *wwin = data;
+
+	(void) sender;
+
+	CloseWindowMenu(wwin->screen_ptr);
+
+	if (event->xbutton.button != Button1)
+		return;
+
+	if (wwin->flags.maximized)
+		wUnmaximizeWindow(wwin);
+	else
+		wMaximizeWindow(wwin, MAX_VERTICAL | MAX_HORIZONTAL, wGetHeadForWindow(wwin));
+}
 
 static void windowIconifyClick(WCoreWindow *sender, void *data, XEvent *event)
 {

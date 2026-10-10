@@ -126,6 +126,7 @@ static WDECallbackUpdate setMenuTextFont;
 static WDECallbackUpdate setIconTitleFont;
 static WDECallbackUpdate setIconTitleColor;
 static WDECallbackUpdate setIconTitleBack;
+static WDECallbackUpdate setMacChrome;
 static WDECallbackUpdate setFrameBorderWidth;
 static WDECallbackUpdate setFrameBorderColor;
 static WDECallbackUpdate setFrameFocusedBorderColor;
@@ -347,6 +348,9 @@ WDefaultEntry staticOptionList[] = {
 	    &wPreferences.focus_mode, getEnum, NULL, NULL, NULL},	/* manual to sloppy without restart */
 	{"NewStyle", "new", seTitlebarModes,
 	    &wPreferences.new_style, getEnum, NULL, NULL, NULL},
+	/* must follow NewStyle: it forces the TS_NEW button layout */
+	{"MacChrome", "NO", NULL,
+	    &wPreferences.mac_chrome, getBool, setMacChrome, NULL, NULL},
 	{"DisableDock", "NO", (void *)WM_DOCK,
 	    NULL, getBool, setIfDockPresent, NULL, NULL},
 	{"DisableClip", "NO", (void *)WM_CLIP,
@@ -3196,6 +3200,22 @@ static int setIconTitleBack(WScreen * scr, WDefaultEntry * entry, void *tdata, v
 	scr->icon_title_texture = wTextureMakeSolid(scr, color);
 
 	return REFRESH_ICON_TITLE_BACK;
+}
+
+static int setMacChrome(WScreen * scr, WDefaultEntry * entry, void *tdata, void *foo)
+{
+	/* Parameters not used, but tell the compiler that it is ok */
+	(void) scr;
+	(void) entry;
+	(void) tdata;
+	(void) foo;
+
+	/* the traffic-light layout reuses the TS_NEW arrangement (buttons are
+	 * siblings of the titlebar, which ends where they begin) */
+	if (wPreferences.mac_chrome)
+		wPreferences.new_style = TS_NEW;
+
+	return 0;
 }
 
 static int setFrameBorderWidth(WScreen * scr, WDefaultEntry * entry, void *tdata, void *foo)

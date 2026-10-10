@@ -445,3 +445,17 @@ apps in their own session.
 All of the `-O2` and wrlib numbers above are from QEMU. The Pi measurements (run `x11_bench :0 5`
 under Xvfb on the Pi, plus a subjective check of menus, window moves and Terminal scrolling)
 are still to be done, and this file will be updated when they are.
+
+## MacChrome (traffic-light window frames)
+
+`MacChrome = YES` in the WindowMaker defaults (shipped on) switches the window frame to a Mac-style look
+without adding any per-frame cost beyond the existing solid-texture path. Set it to `NO` for stock Window Maker.
+
+- Titlebar: solid light gray (`FTitleBack`/`UTitleBack`), capped at 18 px by `WindowTitleMaxHeight`, a 1 px separator line, no bevel.
+- Buttons: three 12 px circles packed against the left edge, left to right close (red), miniaturize (yellow),
+  zoom (green; new, toggles maximize like the window menu). Unfocused windows show gray circles; pressed darkens.
+  Each button is a full-height 20 px slot painted in the titlebar's own background, so nothing overlaps the titlebar.
+- Frame: 1 px gray border (`FrameBorderColor`), resize bar cut from 8 px to 3 px and drawn flat (`RESIZEBAR_HEIGHT` in `wconfig.h.in`).
+- Forces `NewStyle = new` (the button layout reuses that arrangement). Use solid title textures only.
+- Code: `src/framewin.c` (`macLayout`, `paintMacButton`), `windowZoomClick` in `src/window.c`, `setMacChrome` in `src/defaults.c`.
+- Not verified on screen yet: it builds clean, but QEMU graphics is blocked (DAR-443), so it needs a look on the real Pi.

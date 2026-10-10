@@ -73,6 +73,135 @@ static void allocFrameBorderPixel(Colormap colormap, const char *color_name, uns
 		**pixel = xcol.pixel;
 }
 
+/*
+ * MacChrome: the traffic-light titlebar. Each button is a full-height slot
+ * (MAC_SLOT_W wide) painted with the titlebar's own background and one
+ * MAC_DOT circle in the middle; the slots are packed against the left edge
+ * in the order close (red), miniaturize (yellow), zoom (green), and the
+ * titlebar window starts where they end (the TS_NEW arrangement, so nothing
+ * overlaps). Solid title textures only: a gradient would need its own
+ * per-slot background pixmaps, which is what the speed here is saving.
+ */
+#define MAC_SLOT_W	20
+#define MAC_DOT		12
+
+enum { MAC_RED, MAC_YELLOW, MAC_GREEN, MAC_GRAY };
+
+static const char *mac_colors[8] = {
+	"#ff5f57", "#febc2e", "#28c840", "#d0d0d0",	/* fills */
+	"#e0443e", "#dea123", "#1aab29", "#aaaaaa"	/* outlines, and the pushed fill */
+};
+
+/* One cache entry, for the first colormap seen (the default one in practice):
+ * allocating 8 colors is 16 server round trips, too much to repeat per window. */
+static Colormap mac_cache_cmap;
+static unsigned long mac_cache[8];
+static int mac_cache_ok;
+
+static void macAllocPixels(WFrameWindow * fwin)
+{
+	XColor xcol;
+	int i;
+
+	if (fwin->mac_pixel_ok)
+		return;
+
+	if (mac_cache_ok && mac_cache_cmap == fwin->colormap) {
+		memcpy(fwin->mac_pixel, mac_cache, sizeof(mac_cache));
+		fwin->mac_pixel_ok = 1;
+		return;
+	}
+
+	for (i = 0; i < 8; i++) {
+		if (!wGetColorForColormap(fwin->colormap, mac_colors[i], &xcol))
+			xcol.pixel = fwin->screen_ptr->black_pixel;
+		fwin->mac_pixel[i] = xcol.pixel;
+	}
+	fwin->mac_pixel_ok = 1;
+
+	if (!mac_cache_ok) {
+		memcpy(mac_cache, fwin->mac_pixel, sizeof(mac_cache));
+		mac_cache_cmap = fwin->colormap;
+		mac_cache_ok = 1;
+	}
+}
+
+/* the 1px line under the titlebar, in the frame border's colour */
+static void macSeparator(WFrameWindow * fwin, Window win, int w, int h)
+{
+	WScreen *scr = fwin->screen_ptr;
+	unsigned long *pixel = fwin->flags.state == WS_FOCUSED ? fwin->focused_border_pixel : fwin->border_pixel;
+
+	if (!pixel)
+		return;
+	XSetClipMask(dpy, scr->copy_gc, None);
+	XSetForeground(dpy, scr->copy_gc, *pixel);
+	XDrawLine(dpy, win, scr->copy_gc, 0, h - 1, w, h - 1);
+}
+
+static void paintMacButton(WFrameWindow * fwin, WCoreWindow * button, int pushed)
+{
+	WScreen *scr = fwin->screen_ptr;
+	int which, x, y;
+
+	macAllocPixels(fwin);
+
+	if (fwin->flags.state != WS_FOCUSED && !pushed)
+		which = MAC_GRAY;
+	else if (button == fwin->right_button)
+		which = MAC_RED;
+	else if (button == fwin->left_button)
+		which = MAC_YELLOW;
+	else
+		which = MAC_GREEN;
+
+	XClearWindow(dpy, button->window);
+
+	x = (button->width - MAC_DOT) / 2;
+	y = (button->height - MAC_DOT) / 2;
+	XSetClipMask(dpy, scr->copy_gc, None);
+	XSetForeground(dpy, scr->copy_gc, fwin->mac_pixel[pushed ? which + 4 : which]);
+	XFillArc(dpy, button->window, scr->copy_gc, x, y, MAC_DOT - 1, MAC_DOT - 1, 0, 360 * 64);
+	XSetForeground(dpy, scr->copy_gc, fwin->mac_pixel[which + 4]);
+	XDrawArc(dpy, button->window, scr->copy_gc, x, y, MAC_DOT - 1, MAC_DOT - 1, 0, 360 * 64);
+
+	macSeparator(fwin, button->window, button->width, button->height);
+}
+
+/* titlebar + visible buttons, packed left; called wherever updateTitlebar() is */
+static void macLayout(WFrameWindow * fwin, int theight)
+{
+	WCoreWindow *order[3];
+	int visible[3];
+	int n = 0, i, x, w;
+
+	order[0] = fwin->right_button;
+	visible[0] = !fwin->flags.hide_right_button && !fwin->flags.rbutton_dont_fit;
+	order[1] = fwin->left_button;
+	visible[1] = !fwin->flags.hide_left_button && !fwin->flags.lbutton_dont_fit;
+	order[2] = fwin->zoom_button;
+	visible[2] = !fwin->flags.hide_zoom_button && !fwin->flags.zbutton_dont_fit;
+
+	for (i = 0; i < 3; i++) {
+		if (!order[i])
+			visible[i] = 0;
+		n += visible[i];
+	}
+
+	w = fwin->core->width + 1 - n * MAC_SLOT_W;
+	if (fwin->titlebar->width != w)
+		fwin->flags.need_texture_remake = 1;
+	wCoreConfigure(fwin->titlebar, n * MAC_SLOT_W, 0, w, theight);
+
+	x = 0;
+	for (i = 0; i < 3; i++) {
+		if (!visible[i])
+			continue;
+		wCoreConfigure(order[i], x, 0, MAC_SLOT_W, theight);
+		x += MAC_SLOT_W;
+	}
+}
+
 WFrameWindow *wFrameWindowCreate(WScreen * scr, int wlevel, int x, int y,
 				 int width, int height, int *clearance,
 				 int *title_min, int *title_max, int flags,
@@ -219,6 +348,10 @@ void wFrameWindowUpdateBorders(WFrameWindow * fwin, int flags)
 				wCoreDestroy(fwin->right_button);
 			fwin->right_button = NULL;
 
+			if (fwin->zoom_button)
+				wCoreDestroy(fwin->zoom_button);
+			fwin->zoom_button = NULL;
+
 			wCoreDestroy(fwin->titlebar);
 			fwin->titlebar = NULL;
 
@@ -321,6 +454,16 @@ void wFrameWindowUpdateBorders(WFrameWindow * fwin, int flags)
 					XMapRaised(dpy, fwin->right_button->window);
 			}
 
+			if ((flags & WFF_ZOOM_BUTTON) && wPreferences.mac_chrome) {
+				fwin->flags.zoom_button = 1;
+				fwin->zoom_button = wCoreCreate(fwin->core, 0, 0, bsize, bsize);
+
+				if (width < theight * 4)
+					fwin->flags.zbutton_dont_fit = 1;
+				else
+					XMapRaised(dpy, fwin->zoom_button->window);
+			}
+
 			if (wPreferences.new_style == TS_NEW)
 				updateTitlebar(fwin);
 
@@ -410,6 +553,13 @@ void wFrameWindowUpdateBorders(WFrameWindow * fwin, int flags)
 		fwin->right_button->descriptor.handle_mousedown = buttonMouseDown;
 	}
 
+	if (fwin->zoom_button) {
+		fwin->zoom_button->descriptor.parent = fwin;
+		fwin->zoom_button->descriptor.parent_type = WCLASS_FRAME;
+		fwin->zoom_button->descriptor.handle_expose = handleButtonExpose;
+		fwin->zoom_button->descriptor.handle_mousedown = buttonMouseDown;
+	}
+
 	checkTitleSize(fwin);
 
 	allocFrameBorderPixel(fwin->colormap, WMGetColorRGBDescription(scr->frame_border_color), &fwin->border_pixel);
@@ -445,6 +595,9 @@ void wFrameWindowDestroy(WFrameWindow * fwin)
 
 	if (fwin->right_button)
 		wCoreDestroy(fwin->right_button);
+
+	if (fwin->zoom_button)
+		wCoreDestroy(fwin->zoom_button);
 
 	if (fwin->resizebar)
 		wCoreDestroy(fwin->resizebar);
@@ -503,6 +656,11 @@ static void updateTitlebar(WFrameWindow * fwin)
 
 	if (theight < *fwin->title_min_height)
 		theight = *fwin->title_min_height;
+
+	if (wPreferences.mac_chrome) {
+		macLayout(fwin, theight);
+		return;
+	}
 
 	x = 0;
 	w = fwin->core->width + 1;
@@ -803,6 +961,9 @@ static void updateTexture(WFrameWindow * fwin)
 				if (fwin->right_button && fwin->rbutton_back[i])
 					XSetWindowBackgroundPixmap(dpy, fwin->right_button->window,
 								   fwin->rbutton_back[i]);
+				if (fwin->zoom_button && fwin->rbutton_back[i])
+					XSetWindowBackgroundPixmap(dpy, fwin->zoom_button->window,
+								   fwin->rbutton_back[i]);
 			}
 		} else {
 			pixel = fwin->title_texture[i]->solid.normal.pixel;
@@ -816,6 +977,8 @@ static void updateTexture(WFrameWindow * fwin)
 #endif
 				if (fwin->right_button)
 					XSetWindowBackground(dpy, fwin->right_button->window, pixel);
+				if (fwin->zoom_button)
+					XSetWindowBackground(dpy, fwin->zoom_button->window, pixel);
 			}
 		}
 		XClearWindow(dpy, fwin->titlebar->window);
@@ -833,6 +996,10 @@ static void updateTexture(WFrameWindow * fwin)
 		if (fwin->right_button) {
 			XClearWindow(dpy, fwin->right_button->window);
 			handleButtonExpose(&fwin->right_button->descriptor, NULL);
+		}
+		if (fwin->zoom_button) {
+			XClearWindow(dpy, fwin->zoom_button->window);
+			handleButtonExpose(&fwin->zoom_button->descriptor, NULL);
 		}
 	}
 }
@@ -958,13 +1125,16 @@ void wFrameWindowPaint(WFrameWindow * fwin)
 		updateTexture(fwin);
 	}
 
-	if (fwin->titlebar && !fwin->flags.repaint_only_resizebar
+	if (fwin->titlebar && !fwin->flags.repaint_only_resizebar && wPreferences.mac_chrome) {
+		macSeparator(fwin, fwin->titlebar->window, fwin->titlebar->width, fwin->titlebar->height);
+	} else if (fwin->titlebar && !fwin->flags.repaint_only_resizebar
 	    && fwin->title_texture[state]->any.type == WTEX_SOLID) {
 		wDrawBevel(fwin->titlebar->window, fwin->titlebar->width,
 			   fwin->titlebar->height, (WTexSolid *) fwin->title_texture[state], WREL_RAISED);
 	}
 
 	if (fwin->resizebar && !fwin->flags.repaint_only_titlebar
+	    && !wPreferences.mac_chrome
 	    && fwin->resizebar_texture[0]->any.type == WTEX_SOLID) {
 		Window win;
 		int w, h;
@@ -1094,6 +1264,8 @@ void wFrameWindowPaint(WFrameWindow * fwin)
 			handleButtonExpose(&fwin->left_button->descriptor, NULL);
 		if (fwin->right_button)
 			handleButtonExpose(&fwin->right_button->descriptor, NULL);
+		if (fwin->zoom_button)
+			handleButtonExpose(&fwin->zoom_button->descriptor, NULL);
 #ifdef XKB_BUTTON_HINT
 		if (fwin->language_button)
 			handleButtonExpose(&fwin->language_button->descriptor, NULL);
@@ -1151,6 +1323,20 @@ static void reconfigure(WFrameWindow * fwin, int x, int y, int width, int height
 			}
 		}
 #endif
+
+		if (fwin->zoom_button) {
+			if (width < fwin->top_width * k && !fwin->flags.zbutton_dont_fit) {
+				if (!fwin->flags.hide_zoom_button)
+					XUnmapWindow(dpy, fwin->zoom_button->window);
+
+				fwin->flags.zbutton_dont_fit = 1;
+			} else if (width >= fwin->top_width * k && fwin->flags.zbutton_dont_fit) {
+				if (!fwin->flags.hide_zoom_button)
+					XMapWindow(dpy, fwin->zoom_button->window);
+
+				fwin->flags.zbutton_dont_fit = 0;
+			}
+		}
 
 		if (fwin->right_button) {
 			if (width < fwin->top_width * 2 && !fwin->flags.rbutton_dont_fit) {
@@ -1392,6 +1578,11 @@ static void handleButtonExpose(WObjDescriptor * desc, XEvent * event)
 	/* Parameter not used, but tell the compiler that it is ok */
 	(void) event;
 
+	if (wPreferences.mac_chrome) {
+		paintMacButton(fwin, button, False);
+		return;
+	}
+
 #ifdef XKB_BUTTON_HINT
 	if (button == fwin->language_button) {
 		if (wPreferences.modelock)
@@ -1464,7 +1655,10 @@ static void buttonMouseDown(WObjDescriptor * desc, XEvent * event)
 
 	pixel = WMColorPixel(fwin->title_color[fwin->flags.state]);
 	texture = fwin->title_texture[fwin->flags.state];
-	paintButton(button, texture, pixel, image, True);
+	if (wPreferences.mac_chrome)
+		paintMacButton(fwin, button, True);
+	else
+		paintButton(button, texture, pixel, image, True);
 
 	while (!done) {
 		WMMaskEvent(dpy, LeaveWindowMask | EnterWindowMask | ButtonReleaseMask
@@ -1472,12 +1666,18 @@ static void buttonMouseDown(WObjDescriptor * desc, XEvent * event)
 		switch (ev.type) {
 		case LeaveNotify:
 			execute = 0;
-			paintButton(button, texture, pixel, image, False);
+			if (wPreferences.mac_chrome)
+				paintMacButton(fwin, button, False);
+			else
+				paintButton(button, texture, pixel, image, False);
 			break;
 
 		case EnterNotify:
 			execute = 1;
-			paintButton(button, texture, pixel, image, True);
+			if (wPreferences.mac_chrome)
+				paintMacButton(fwin, button, True);
+			else
+				paintButton(button, texture, pixel, image, True);
 			break;
 
 		case ButtonPress:
@@ -1492,12 +1692,18 @@ static void buttonMouseDown(WObjDescriptor * desc, XEvent * event)
 			WMHandleEvent(&ev);
 		}
 	}
-	paintButton(button, texture, pixel, image, False);
+	if (wPreferences.mac_chrome)
+		paintMacButton(fwin, button, False);
+	else
+		paintButton(button, texture, pixel, image, False);
 
 	if (execute) {
 		if (button == fwin->left_button) {
 			if (fwin->on_click_left)
 				(*fwin->on_click_left) (button, fwin->child, &ev);
+		} else if (button == fwin->zoom_button) {
+			if (fwin->on_click_zoom)
+				(*fwin->on_click_zoom) (button, fwin->child, &ev);
 		} else if (button == fwin->right_button) {
 			if (fwin->on_click_right)
 				(*fwin->on_click_right) (button, fwin->child, &ev);

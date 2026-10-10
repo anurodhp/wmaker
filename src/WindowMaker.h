@@ -347,6 +347,7 @@ extern struct WPreferences {
 	char ignore_focus_click;
 	char open_transients_with_parent;  /* open transient window in same workspace as parent */
 	signed char title_justification;   /* titlebar text alignment */
+	char mac_chrome;                   /* traffic-light titlebar, thin frame (see framewin.c) */
 	int window_title_clearance;
 	int window_title_min_height;
 	int window_title_max_height;
