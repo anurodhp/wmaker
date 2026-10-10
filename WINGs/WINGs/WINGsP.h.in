@@ -466,6 +466,12 @@ typedef struct W_Font {
 
     struct _XftFont *font;
 
+    /* fonts for characters font lacks (CJK, emoji, ...), found on demand */
+    struct _XftFont *fallbacks[8];
+    int nfallbacks;
+    unsigned int missing[16];
+    int nmissing;
+
     short height;
     short y;
     short refCount;

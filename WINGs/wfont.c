@@ -167,6 +167,8 @@ WMFont *WMCreateFont(WMScreen * scrPtr, const char *fontName)
 	font->y = font->font->ascent;
 
 	font->refCount = 1;
+	font->nfallbacks = 0;
+	font->nmissing = 0;
 
 	font->name = fname;
 
@@ -209,6 +211,10 @@ void WMReleaseFont(WMFont * font)
 
 	font->refCount--;
 	if (font->refCount < 1) {
+		int i;
+
+		for (i = 0; i < font->nfallbacks; i++)
+			XftFontClose(font->screen->display, font->fallbacks[i]);
 		XftFontClose(font->screen->display, font->font);
 		if (font->name) {
 			WMHashRemove(font->screen->fontCache, font->name);
@@ -293,13 +299,117 @@ WMFont *WMBoldSystemFontOfSize(WMScreen * scrPtr, int size)
 	return font;
 }
 
+#ifndef USE_PANGO
+/* Xft draws a string with one font and shows a box for every character that
+ * font lacks, so a CJK or emoji title is boxes.  Draw it in runs instead, each
+ * in the first font that has the characters: the requested font, else one
+ * fontconfig finds for the character (same name and size, plus a charset
+ * request, which fontconfig weighs before the family). */
+static XftFont *fontForChar(WMFont *font, FcChar32 c)
+{
+	Display *dpy = font->screen->display;
+	FcPattern *pattern, *match;
+	FcCharSet *cs;
+	FcResult result;
+	XftFont *f;
+	int i;
+
+	if (c < 0x80 || XftCharExists(dpy, font->font, c))
+		return font->font;
+	for (i = 0; i < font->nfallbacks; i++)
+		if (XftCharExists(dpy, font->fallbacks[i], c))
+			return font->fallbacks[i];
+	for (i = 0; i < font->nmissing; i++)
+		if (font->missing[i] == c)
+			return font->font;
+	if (font->nfallbacks < 8) {
+		pattern = FcNameParse((FcChar8 *) font->name);
+		if (pattern) {
+			cs = FcCharSetCreate();
+			FcCharSetAddChar(cs, c);
+			FcPatternAddCharSet(pattern, FC_CHARSET, cs);
+			FcCharSetDestroy(cs);
+			FcConfigSubstitute(NULL, pattern, FcMatchPattern);
+			XftDefaultSubstitute(dpy, font->screen->screen, pattern);
+			match = FcFontMatch(NULL, pattern, &result);
+			FcPatternDestroy(pattern);
+			if (match) {
+				f = XftFontOpenPattern(dpy, match);
+				if (!f)
+					FcPatternDestroy(match);
+				else if (XftCharExists(dpy, f, c)) {
+					font->fallbacks[font->nfallbacks++] = f;
+					return f;
+				} else
+					XftFontClose(dpy, f);
+			}
+		}
+	}
+	if (font->nmissing < 16)
+		font->missing[font->nmissing++] = c;
+	return font->font;
+}
+
+/* the next code point of UTF-8 text; bad bytes come out as themselves */
+static FcChar32 nextChar(const char *text, int length, int *n)
+{
+	const unsigned char *s = (const unsigned char *)text;
+	FcChar32 c = s[0];
+	int len = c >= 0xf0 ? 4 : c >= 0xe0 ? 3 : c >= 0xc0 ? 2 : 1, i;
+
+	if (len > length)
+		len = 1;
+	if (len > 1) {
+		c &= 0x3f >> (len - 1);
+		for (i = 1; i < len; i++) {
+			if ((s[i] & 0xc0) != 0x80) {
+				*n = 1;
+				return s[0];
+			}
+			c = (c << 6) | (s[i] & 0x3f);
+		}
+	}
+	*n = len;
+	return c;
+}
+
+/* Draw text (or only measure it, color == NULL) in runs of one font each;
+ * returns the advance. */
+static int runsOfFonts(WMFont *font, XftDraw *draw, XftColor *color, int x, int y,
+		       const char *text, int length)
+{
+	Display *dpy = font->screen->display;
+	int start = 0, total = 0;
+
+	while (start < length) {
+		XftFont *f = NULL;
+		int end = start, n;
+		XGlyphInfo extents;
+
+		while (end < length) {
+			XftFont *g = fontForChar(font, nextChar(text + end, length - end, &n));
+
+			if (f && g != f)
+				break;
+			f = g;
+			end += n;
+		}
+		XftTextExtentsUtf8(dpy, f, (XftChar8 *) text + start, end - start, &extents);
+		if (color)
+			XftDrawStringUtf8(draw, color, f, x + total, y + font->y,
+					  (XftChar8 *) text + start, end - start);
+		total += extents.xOff;
+		start = end;
+	}
+	return total;
+}
+#endif
+
 int WMWidthOfString(WMFont * font, const char *text, int length)
 {
 #ifdef USE_PANGO
 	const char *previous_text;
 	int width;
-#else
-	XGlyphInfo extents;
 #endif
 
 	wassertrv(font != NULL && text != NULL, 0);
@@ -311,9 +421,7 @@ int WMWidthOfString(WMFont * font, const char *text, int length)
 
 	return width;
 #else
-	XftTextExtentsUtf8(font->screen->display, font->font, (XftChar8 *) text, length, &extents);
-
-	return extents.xOff;	/* don't ask :P */
+	return runsOfFonts(font, NULL, NULL, 0, 0, text, length);
 #endif
 }
 
@@ -340,7 +448,7 @@ void WMDrawString(WMScreen * scr, Drawable d, WMColor * color, WMFont * font, in
 		pango_layout_set_text(font->layout, text, length);
 	pango_xft_render_layout(scr->xftdraw, &xftcolor, font->layout, x * PANGO_SCALE, y * PANGO_SCALE);
 #else
-	XftDrawStringUtf8(scr->xftdraw, &xftcolor, font->font, x, y + font->y, (XftChar8 *) text, length);
+	runsOfFonts(font, scr->xftdraw, &xftcolor, x, y, text, length);
 #endif
 }
 
@@ -378,7 +486,7 @@ WMDrawImageString(WMScreen * scr, Drawable d, WMColor * color, WMColor * backgro
 		pango_layout_set_text(font->layout, text, length);
 	pango_xft_render_layout(scr->xftdraw, &textColor, font->layout, x * PANGO_SCALE, y * PANGO_SCALE);
 #else
-	XftDrawStringUtf8(scr->xftdraw, &textColor, font->font, x, y + font->y, (XftChar8 *) text, length);
+	runsOfFonts(font, scr->xftdraw, &textColor, x, y, text, length);
 #endif
 }
 
