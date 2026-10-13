@@ -1364,6 +1364,10 @@ static Bool handleWindowType(WWindow *wwin, Atom type, int *layer)
 		wwin->client_flags.skip_window_list = 1;
 		wwin->client_flags.skip_switchpanel = 1;
 		wwin->client_flags.dont_move_off = 1;
+		/* A dock cannot be moved, so the Meta+button grab (wWindowResetMouseGrabs())
+		 * has nothing to do on it, and it would swallow every modified click
+		 * the dock's own client wants, such as an Option-click in a menu bar. */
+		wwin->client_flags.no_bind_mouse = 1;
 		wwin->flags.net_skip_pager = 1;
 	} else if (type == net_wm_window_type_toolbar ||
 	           type == net_wm_window_type_menu) {
@@ -1509,6 +1513,10 @@ static void updateWindowType(WWindow *wwin)
 		wFrameWindowPaint(wwin->frame);
 		wNETWMUpdateActions(wwin, False);
 	}
+	/* The type can change after the window is managed (a dock that sets
+	 * _NET_WM_WINDOW_TYPE once mapped); the mouse grabs were made from the
+	 * old flags (no_bind_mouse for docks), so make them again. */
+	wWindowResetMouseGrabs(wwin);
 }
 
 void wNETWMCheckClientHints(WWindow *wwin, int *layer, int *workspace)
